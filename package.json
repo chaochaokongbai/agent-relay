@@ -1,0 +1,33 @@
+{
+  "name": "agent-relay",
+  "version": "0.1.0",
+  "description": "接力棒：给任意 AI Agent 会话一份持久工作记录，跨会话/跨客户端不丢失上下文。零依赖 Node CLI + 协作模板 + 五大客户端共享记忆接入配置生成器。",
+  "type": "module",
+  "bin": {
+    "relay": "bin/relay.mjs"
+  },
+  "files": [
+    "bin",
+    "templates",
+    "examples",
+    "README.md",
+    "README.en.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test": "node tests/run.mjs"
+  },
+  "keywords": [
+    "ai-agent",
+    "context",
+    "handoff",
+    "mcp",
+    "multi-agent",
+    "llm",
+    "beginner"
+  ],
+  "license": "MIT"
+}
