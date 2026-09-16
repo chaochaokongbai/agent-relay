@@ -1,4 +1,5 @@
 # agent-relay 接力棒
+[![Test](https://github.com/chaochaokongbai/agent-relay/actions/workflows/test.yml/badge.svg)](https://github.com/chaochaokongbai/agent-relay/actions/workflows/test.yml)
 
 > 换个会话、换个客户端，AI 就失忆？给它一根接力棒。
 
@@ -43,8 +44,10 @@ relay paste    # 生成整段粘贴模板，贴进对话即可，模型按固定
 |---|---|
 | `relay init [dir]` | 创建 `.relay/` 工作记录 |
 | `relay note <text> [--who 名字]` | 追加交接记录（`RELAY_WHO` 环境变量可设默认署名） |
-| `relay board add <text>` | 任务板加待办 |
-| `relay board done <关键词>` | 匹配的任务移到已完成 |
+| `relay decision <text...>` | 追加一条带时间戳的决策记录（`--who` 署名） |
+| `relay board add <text...>` | 任务板「待办」加一条 |
+| `relay board done <关键词>` | 匹配的任务移到已完成（精确优先；多条命中报错） |
+| `relay board done --index <n>` | 按待办顺序（1 基）精确完成第 n 条 |
 | `relay brief [--tail N]` | 输出可粘贴的上下文简报 |
 | `relay paste` | 纯聊天客户端粘贴模板 |
 | `relay connect --client <name>` | 输出该客户端接入共享记忆 MCP 的配置 |
