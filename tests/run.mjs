@@ -40,6 +40,15 @@ check('board done', () => {
   const board = fs.readFileSync(path.join(tmp, '.relay', 'board.md'), 'utf8');
   assert(board.includes('- [x] 实现登录页'), 'done move failed');
 });
+check('decision', () => {
+  const text = '采用 JSON 配置驱动';
+  run('decision', text);
+  const decisions = fs.readFileSync(path.join(tmp, '.relay', 'decisions.md'), 'utf8');
+  assert(decisions.includes(text), 'decision entry missing');
+  assert(decisions.includes('[tester]'), 'decision missing author');
+  const out = run('brief');
+  assert(out.includes(text), 'brief missing decision');
+});
 check('brief', () => {
   const out = run('brief');
   assert(out.includes('接力简报'), 'brief header missing');

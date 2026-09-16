@@ -11,6 +11,7 @@ const HELP = `relay — 接力棒：给 AI Agent 会话一份持久工作记录
 用法:
   relay init [dir]              在 dir（默认当前目录）创建 .relay/ 工作记录
   relay note <text...>          追加一条带时间戳的交接记录（--who 署名）
+  relay decision <text...>      追加一条带时间戳的决策记录（--who 署名）
   relay board add <text...>     任务板「待办」加一条
   relay board done <keyword>    把含 keyword 的任务移到「已完成」
                                 精确匹配优先；命中多条会列出候选并报错（不静默删第一条）
@@ -96,6 +97,16 @@ function cmdNote(args) {
   const p = path.join(root, RELAY_DIR, 'handoff.md');
   fs.appendFileSync(p, `- [${stamp()}] [${author}] ${text}\n`);
   console.log('relay: 已记录');
+}
+
+function cmdDecision(args) {
+  const root = rootOrFail();
+  const author = who(args);
+  const text = args.join(' ').trim();
+  if (!text) fail('decision 需要内容');
+  const p = path.join(root, RELAY_DIR, 'decisions.md');
+  fs.appendFileSync(p, `- [${stamp()}] [${author}] ${text}\n`);
+  console.log('relay: 已记录决策');
 }
 
 function todoText(line) {
@@ -242,6 +253,7 @@ const [, , cmd, ...rest] = process.argv;
 switch (cmd) {
   case 'init': cmdInit(rest[0]); break;
   case 'note': cmdNote(rest); break;
+  case 'decision': cmdDecision(rest); break;
   case 'board': cmdBoard(rest); break;
   case 'brief': cmdBrief(rest); break;
   case 'paste': cmdPaste(rest); break;
