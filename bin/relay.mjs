@@ -13,6 +13,8 @@ const HELP = `relay — 接力棒：给 AI Agent 会话一份持久工作记录
   relay note <text...>          追加一条带时间戳的交接记录（--who 署名）
   relay board add <text...>     任务板「待办」加一条
   relay board done <keyword>    把含 keyword 的任务移到「已完成」
+                                精确匹配优先；命中多条会列出候选并报错（不静默删第一条）
+  relay board done --index <n>  按待办顺序（1 基）精确完成第 n 条
   relay brief [--tail N]        输出可粘贴进新会话/新客户端的上下文简报（默认 N=15）
   relay paste                   输出纯聊天客户端（豆包等）用的粘贴模板
   relay connect --client <name> 输出该客户端接入共享记忆 MCP 的配置
@@ -96,31 +98,57 @@ function cmdNote(args) {
   console.log('relay: 已记录');
 }
 
+function todoText(line) {
+  return line.replace(/^\s*- \[ \]\s*/, '').trim();
+}
+
 function cmdBoard(args) {
   const root = rootOrFail();
   const sub = args.shift();
   const p = path.join(root, RELAY_DIR, 'board.md');
-  let content = read(p) || boardTemplate();
+  let content = (read(p) || boardTemplate()).replace(/\r/g, '');
   if (sub === 'add') {
     const text = args.join(' ').trim();
     if (!text) fail('board add 需要内容');
     const lines = content.split('\n');
-    const i = lines.indexOf('## 待办');
+    const i = lines.findIndex((l) => l.trimEnd() === '## 待办');
     if (i === -1) fail('任务板缺少「## 待办」节');
     lines.splice(i + 1, 0, `- [ ] ${text}`);
     fs.writeFileSync(p, lines.join('\n'));
-    console.log('relay: 已加入待办');
+    console.log(`relay: 已加入待办：${text}`);
   } else if (sub === 'done') {
+    const indexArg = flag(args, '--index');
     const kw = args.join(' ').trim();
-    if (!kw) fail('board done 需要关键词');
     const lines = content.split('\n');
-    const ti = lines.findIndex((l) => l.startsWith('- [ ]') && l.includes(kw));
-    if (ti === -1) fail(`待办里找不到含「${kw}」的条目`);
+    const todoIdx = [];
+    lines.forEach((l, i) => { if (/^\s*- \[ \]/.test(l)) todoIdx.push(i); });
+    if (!todoIdx.length) fail('待办里没有可完成的条目');
+    const listTodos = (idxs) => idxs.map((i) => `  ${todoIdx.indexOf(i) + 1}. ${todoText(lines[i])}`).join('\n');
+    let ti;
+    if (indexArg !== null) {
+      const n = parseInt(indexArg, 10);
+      if (!Number.isInteger(n) || n < 1 || n > todoIdx.length) fail(`--index 超出范围（1..${todoIdx.length}）`);
+      ti = todoIdx[n - 1];
+    } else {
+      if (!kw) fail('board done 需要关键词或 --index <n>');
+      const exact = todoIdx.filter((i) => todoText(lines[i]) === kw);
+      const partial = todoIdx.filter((i) => todoText(lines[i]).includes(kw));
+      const pool = exact.length ? exact : partial;
+      if (!pool.length) fail(`待办里找不到「${kw}」。当前待办：\n${listTodos(todoIdx)}`);
+      if (pool.length > 1) fail(`「${kw}」匹配到 ${pool.length} 条，请用 --index 指定其一，避免误删：\n${listTodos(pool)}`);
+      ti = pool[0];
+    }
     const [line] = lines.splice(ti, 1);
-    const di = lines.indexOf('## 已完成');
-    lines.splice(di + 1, 0, line.replace('- [ ]', '- [x]') + `（${stamp()} 完成）`);
+    const doneLine = line.replace(/^(\s*- )\[ \]/, '$1[x]') + `（${stamp()} 完成）`;
+    let di = lines.findIndex((l) => l.trimEnd() === '## 已完成');
+    if (di === -1) {
+      while (lines.length && lines[lines.length - 1].trim() === '') lines.pop();
+      lines.push('', '## 已完成');
+      di = lines.length - 1;
+    }
+    lines.splice(di + 1, 0, doneLine);
     fs.writeFileSync(p, lines.join('\n'));
-    console.log('relay: 已移到已完成');
+    console.log(`relay: 已移入已完成：${todoText(line)}`);
   } else {
     fail('board 子命令: add | done');
   }
