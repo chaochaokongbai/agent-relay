@@ -8,6 +8,45 @@ import { fileURLToPath } from 'node:url';
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const RELAY_DIR = '.relay';
 
+// 敏感路径前缀（归一化为正斜杠，用 startsWith 匹配）
+const SENSITIVE_PATTERNS = [
+  '.github/',
+  '.relay/',
+  'tests/',
+  'package.json',
+];
+
+function normalizePath(p) {
+  return p.replace(/\\/g, '/');
+}
+
+function isSensitivePath(p) {
+  const np = normalizePath(p);
+  return SENSITIVE_PATTERNS.some((pat) => np.startsWith(pat) || np === pat);
+}
+
+function isCodeFile(p) {
+  const ext = path.extname(p).toLowerCase();
+  return ['.mjs', '.js', '.cjs', '.ts'].includes(ext);
+}
+
+// 判定非代码文件是否有破坏性行删除（return reason string if destructive, null if ok）
+function checkNonCodeDestructive(origContent, newContent) {
+  const origLines = origContent.split('\n');
+  const newLines = newContent.split('\n');
+  // 归一化：trim 后的非空行集合
+  const origSet = new Set(origLines.map((l) => l.trim()).filter((l) => l.length > 0));
+  const newSet = new Set(newLines.map((l) => l.trim()).filter((l) => l.length > 0));
+  let deleted = 0;
+  for (const line of origSet) {
+    if (!newSet.has(line)) deleted++;
+  }
+  if (deleted > 0) {
+    return `非代码文件 ${deleted} 行原有内容被删除，如确需删改请人工执行`;
+  }
+  return null;
+}
+
 const HELP = `relay — 接力棒：给 AI Agent 会话一份持久工作记录
 
 用法:
@@ -23,12 +62,21 @@ const HELP = `relay — 接力棒：给 AI Agent 会话一份持久工作记录
   relay verify <receipt.json>   验证一份写回回执：存活检查 + 把产物应用到项目临时副本 + 跑测试
                                 [--project <dir>] [--test <cmd>] [--no-record]
                                 退出码 0=PASS，1=FAIL，并在 handoff.md 留一条带署名的验证记录
+                                manual 模式允许改敏感路径但写审计日志
   relay auto --dispatch <cmd>   无人值守闭环：取一条待办 → 派发给 <cmd>（headless 模型）→ 收回执
                                 → relay verify → 通过才应用到工作树并移入已完成，否则退回待办
                                 [--task <关键词>] [--model <m>] [--test <cmd>] [--timeout <秒>] [--dry-run]
+                                [--allow-sensitive]  本轮放行敏感路径（auto 默认严格，敏感路径：.github/** .relay/** tests/** package.json）
   relay connect --client <name> 输出该客户端接入共享记忆 MCP 的配置
                                 name: qoder | workbuddy | openclaw | dsh | doubao
   relay help                    本帮助
+
+验证门守卫说明：
+  auto 模式（默认）          严格守卫：任何 changes 命中敏感路径（.github/** .relay/** tests/** package.json）直接 FAIL
+  auto --allow-sensitive     本轮放行敏感路径，但写审计日志
+  manual 模式（verify）      放宽：允许改敏感路径，写审计日志
+  非代码文件                按行判破坏：已存在文件若删除了原有非空行 → FAIL（纯增量放行）
+  代码文件（.mjs/.js/.cjs）   维持 50% 字节阈值
 
 环境变量:
   RELAY_WHO    默认署名（如 "Qoder/claude"），等价于 --who
@@ -226,7 +274,9 @@ function applyChanges(destDir, changes) {
   return { ok: true };
 }
 
-function executeVerify(receipt, project, testCmd) {
+// opts: { strict: bool, onSensitive: (paths[]) => void }
+function executeVerify(receipt, project, testCmd, opts) {
+  const { strict = false, onSensitive = null } = opts || {};
   const isPaste = receipt.transport === 'paste';
   if (!isPaste) {
     const tcc = receipt.tool_call_count;
@@ -238,21 +288,43 @@ function executeVerify(receipt, project, testCmd) {
   if (!changes || !changes.length) {
     return { ok: false, reason: '回执里没有 changes 数组，无产物可验证', detail: '' };
   }
-  // 破坏性写入守卫：形状合格的回执仍可能把「完整全文」写成只含新小节，apply 会清空原文件；
-  // 而 npm test 对文档类破坏是盲的。故对已存在文件，新内容不足原文件一半字节数即拒。
+
+  // 裁决一：敏感路径守卫（严格模式在复制 temp 之前拦截）
+  const sensitiveHits = changes.filter((c) => c && typeof c.path === 'string' && isSensitivePath(c.path));
+  if (strict && sensitiveHits.length > 0) {
+    const paths = sensitiveHits.map((c) => c.path).join(', ');
+    return { ok: false, reason: `敏感路径守卫：auto 模式禁止修改 ${paths}，如确需改请人工执行`, detail: '' };
+  }
+  if (!strict && onSensitive && sensitiveHits.length > 0) {
+    onSensitive(sensitiveHits.map((c) => c.path));
+  }
+
+  // 裁决二：非代码文件按行防破坏守卫
   for (const c of changes) {
     if (!c || typeof c.path !== 'string' || typeof c.content !== 'string') continue;
     const orig = path.resolve(project, c.path);
     const rel = path.relative(project, orig);
-    if (rel.startsWith('..') || path.isAbsolute(rel)) continue; // 越界由 applyChanges 负责
+    if (rel.startsWith('..') || path.isAbsolute(rel)) continue;
     if (!fs.existsSync(orig)) continue; // 新建文件不守卫
-    const before = fs.statSync(orig).size;
-    const after = Buffer.byteLength(c.content);
-    if (before > 0 && after < before * 0.5) {
-      const pct = Math.round((after / before) * 100);
-      return { ok: false, reason: `疑似破坏性写入：${c.path} 新内容仅原文件的 ${pct}%（<50%），已拒绝；如确需大幅删改请人工执行`, detail: '' };
+
+    if (isCodeFile(c.path)) {
+      // 代码文件：50% 字节阈值
+      const before = fs.statSync(orig).size;
+      const after = Buffer.byteLength(c.content);
+      if (before > 0 && after < before * 0.5) {
+        const pct = Math.round((after / before) * 100);
+        return { ok: false, reason: `疑似破坏性写入：${c.path} 新内容仅原文件的 ${pct}%（<50%），已拒绝；如确需大幅删改请人工执行`, detail: '' };
+      }
+    } else {
+      // 非代码文件：按行判定
+      const origContent = fs.readFileSync(orig, 'utf8');
+      const destructiveReason = checkNonCodeDestructive(origContent, c.content);
+      if (destructiveReason) {
+        return { ok: false, reason: `疑似破坏性写入：${destructiveReason}`, detail: '' };
+      }
     }
   }
+
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-verify-'));
   try {
     fs.cpSync(project, temp, {
@@ -309,7 +381,17 @@ function cmdVerify(args) {
   }
   const meta = JSON.parse(read(path.join(relay, 'relay.json')) || '{}');
   const testCmd = testArg || (meta.verify && meta.verify.test) || 'npm test';
-  conclude(relay, receipt, executeVerify(receipt, project, testCmd), noRecord);
+
+  // manual 模式：strict=false，记审计日志
+  const auditLines = [];
+  const onSensitive = (paths) => {
+    auditLines.push(`- [${stamp()}] [verify:manual] 放行敏感路径：${paths.join(', ')}`);
+  };
+  const res = executeVerify(receipt, project, testCmd, { strict: false, onSensitive });
+  if (auditLines.length > 0) {
+    fs.appendFileSync(path.join(relay, 'handoff.md'), auditLines.join('\n') + '\n');
+  }
+  conclude(relay, receipt, res, noRecord);
 }
 
 function findTodoIdx(lines) {
@@ -375,6 +457,7 @@ function cmdAuto(args) {
   const testArg = flag(args, '--test');
   const timeout = parseInt(flag(args, '--timeout') || '600', 10);
   const dryRun = args.includes('--dry-run');
+  const allowSensitive = args.includes('--allow-sensitive');
   if (!dispatch) fail('auto 需要 --dispatch <cmd>：一个接收任务、产出回执 JSON 的命令（示例见 examples/dispatch-openclaw.mjs）');
 
   const bp = path.join(root, RELAY_DIR, 'board.md');
@@ -426,7 +509,14 @@ function cmdAuto(args) {
       res = { ok: false, reason: why, detail: ((d.stdout || '') + (d.stderr || '')).trim() };
     } else {
       console.log(`relay auto: 收到回执 model=${receipt.model || '?'} client=${receipt.client || '?'} tool_call_count=${JSON.stringify(receipt.tool_call_count)}`);
-      res = executeVerify(receipt, root, testCmd);
+      // auto 模式：默认 strict=true，--allow-sensitive 时 strict=false（但仍写审计日志）
+      const strict = !allowSensitive;
+      const auditLines = [];
+      const onSensitive = (paths) => {
+        auditLines.push(`- [${stamp()}] [auto:allow-sensitive] 放行敏感路径：${paths.join(', ')}`);
+      };
+      res = executeVerify(receipt, root, testCmd, { strict, onSensitive });
+      if (auditLines.length > 0) record(auditLines.join('\n'));
       if (res.ok && !dryRun) {
         const applied = applyChanges(root, receipt.changes);
         if (!applied.ok) {
@@ -519,3 +609,5 @@ switch (cmd) {
   case 'help': case undefined: case '--help': case '-h': console.log(HELP); break;
   default: fail(`未知命令 ${cmd}，运行 relay help`);
 }
+
+export { executeVerify, applyChanges, isSensitivePath, checkNonCodeDestructive, SENSITIVE_PATTERNS, isCodeFile };
