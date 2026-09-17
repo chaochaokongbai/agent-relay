@@ -82,10 +82,10 @@ function makeReceipt(changes) {
   return { task_id: 'test', client: 'Test', model: 'm', transport: 'mcp', tool_call_count: 2, changes };
 }
 function runVerifyStrict(receipt, projectDir) {
-  return executeVerify(receipt, projectDir, 'node -e process.exit(0)', { strict: true });
+  return executeVerify(receipt, projectDir, 'node -e "process.exit(0)"', { strict: true });
 }
 function runVerifyManual(receipt, projectDir, onSensitive) {
-  return executeVerify(receipt, projectDir, 'node -e process.exit(0)', { strict: false, onSensitive });
+  return executeVerify(receipt, projectDir, 'node -e "process.exit(0)"', { strict: false, onSensitive });
 }
 
 const tmpS = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-verify-unit-'));
@@ -274,7 +274,7 @@ check('verify: FAIL — 存活检查拦截 tool_call_count=0', () => {
 });
 check('verify: FAIL — 测试命令退出非 0', () => {
   const rec = writeReceipt3('bad.json', { task_id: 'x', client: 'C', model: 'm', tool_call_count: 2, changes: [{ path: 'p.txt', content: 'x' }] });
-  const r = runSafe3('verify', rec, '--project', tmp3, '--test', 'node -e process.exit(1)', '--no-record');
+  const r = runSafe3('verify', rec, '--project', tmp3, '--test', 'node -e "process.exit(1)"', '--no-record');
   assert(r.status === 1 && /验证失败/.test(r.out), '测试失败应 FAIL');
 });
 check('verify: FAIL — 越界写入', () => {
