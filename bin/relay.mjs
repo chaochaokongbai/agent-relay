@@ -238,6 +238,21 @@ function executeVerify(receipt, project, testCmd) {
   if (!changes || !changes.length) {
     return { ok: false, reason: '回执里没有 changes 数组，无产物可验证', detail: '' };
   }
+  // 破坏性写入守卫：形状合格的回执仍可能把「完整全文」写成只含新小节，apply 会清空原文件；
+  // 而 npm test 对文档类破坏是盲的。故对已存在文件，新内容不足原文件一半字节数即拒。
+  for (const c of changes) {
+    if (!c || typeof c.path !== 'string' || typeof c.content !== 'string') continue;
+    const orig = path.resolve(project, c.path);
+    const rel = path.relative(project, orig);
+    if (rel.startsWith('..') || path.isAbsolute(rel)) continue; // 越界由 applyChanges 负责
+    if (!fs.existsSync(orig)) continue; // 新建文件不守卫
+    const before = fs.statSync(orig).size;
+    const after = Buffer.byteLength(c.content);
+    if (before > 0 && after < before * 0.5) {
+      const pct = Math.round((after / before) * 100);
+      return { ok: false, reason: `疑似破坏性写入：${c.path} 新内容仅原文件的 ${pct}%（<50%），已拒绝；如确需大幅删改请人工执行`, detail: '' };
+    }
+  }
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-verify-'));
   try {
     fs.cpSync(project, temp, {

@@ -171,6 +171,17 @@ check('verify: FAIL — 拒绝越界写入', () => {
   assert(/越界/.test(r.out), '应报告拒绝越界写入');
   assert(!fs.existsSync(path.join(path.dirname(tmp3), 'evil.txt')), '不应真的写出越界文件');
 });
+check('verify: FAIL — 破坏性写入守卫（新内容不足原文件一半）', () => {
+  const big = path.join(tmp3, 'big.md');
+  fs.writeFileSync(big, 'x'.repeat(2000));
+  const rec = writeReceipt('shrink.json', {
+    task_id: 'relay-task-x', client: 'TestClient', model: 'test-model',
+    tool_call_count: 2, changes: [{ path: 'big.md', content: 'tiny' }],
+  });
+  const r = runSafe3('verify', rec, '--project', tmp3, '--test', existsTest, '--no-record');
+  assert(r.status === 1, '破坏性写入应判 FAIL');
+  assert(/破坏性/.test(r.out), '应报告疑似破坏性写入');
+});
 
 // 编排器：relay auto（取任务 → 派发 → verify → 通过才应用并移板）
 const ECHO = path.join(path.dirname(BIN), '..', 'examples', 'dispatch-echo.mjs');
