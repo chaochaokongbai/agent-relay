@@ -90,5 +90,16 @@ const fail = (msg) => {
   passed++;
 }
 
+// (6) probe-local.mjs：Ollama 不可达时应优雅退出（try/catch 接管，不抛堆栈）
+{
+  const r = run(['examples/probe-local.mjs'], {
+    OLLAMA_BASE_URL: 'http://127.0.0.1:1/v1',
+  });
+  if (r.status !== 1) fail(`probe-local 不可达应退出 1，实际 ${r.status}`);
+  if (!r.stderr.includes('连不上')) fail('stderr 应含「连不上」');
+  if (/^\s*at /m.test(r.stderr)) fail('stderr 不应含堆栈（已被 try/catch 接管）');
+  passed++;
+}
+
 console.log('all ' + passed + ' checks passed');
 process.exit(0);

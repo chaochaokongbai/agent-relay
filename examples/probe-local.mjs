@@ -14,15 +14,21 @@ const prompt = [
   'tool_call_count(大于 0 的整数), files_read(字符串数组), changes(数组，至少一条 {path, content}，content 为任意非空字符串)。',
 ].join('\n');
 
-const r = await fetch(base + '/chat/completions', {
-  method: 'POST',
-  headers: { 'Content-Type': 'application/json' },
-  body: JSON.stringify({
-    model,
-    messages: [{ role: 'user', content: prompt }],
-    temperature: 0,
-  }),
-});
+let r;
+try {
+  r = await fetch(base + '/chat/completions', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      model,
+      messages: [{ role: 'user', content: prompt }],
+      temperature: 0,
+    }),
+  });
+} catch (e) {
+  console.error('probe-local: 连不上 Ollama（' + base + '）：' + e.message + '；请先启动 Ollama 或用 OLLAMA_BASE_URL 指定可达地址');
+  process.exit(1);
+}
 
 if (!r.ok) {
   console.error('probe-local: HTTP ' + r.status + ' ' + (await r.text()));
