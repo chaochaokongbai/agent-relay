@@ -172,8 +172,56 @@ check('verify: FAIL — 拒绝越界写入', () => {
   assert(!fs.existsSync(path.join(path.dirname(tmp3), 'evil.txt')), '不应真的写出越界文件');
 });
 
+// 编排器：relay auto（取任务 → 派发 → verify → 通过才应用并移板）
+const ECHO = path.join(path.dirname(BIN), '..', 'examples', 'dispatch-echo.mjs');
+const tmp4 = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-test4-'));
+const run4 = (...args) => execFileSync(process.execPath, [BIN, ...args], { cwd: tmp4, encoding: 'utf8', env: { ...process.env, RELAY_WHO: 'tester' } });
+const runSafe4 = (...args) => { try { return { ok: true, status: 0, out: run4(...args) }; } catch (e) { return { ok: false, status: e.status, out: (e.stdout || '') + (e.stderr || '') }; } };
+const board4 = () => fs.readFileSync(path.join(tmp4, '.relay', 'board.md'), 'utf8');
+const handoff4 = () => fs.readFileSync(path.join(tmp4, '.relay', 'handoff.md'), 'utf8');
+const noteTest = `node -e "process.exit(require('fs').existsSync('AUTO-NOTE.md')?0:1)"`;
+
+check('auto: 闭环成功 — 派发→验证→应用→移入已完成', () => {
+  run4('init');
+  run4('board', 'add', '生成自动笔记');
+  const r = runSafe4('auto', '--dispatch', `node ${ECHO}`, '--test', noteTest, '--model', 'none');
+  assert(r.status === 0, 'PASS 时退出码应为 0，实际 ' + r.status + '：' + r.out);
+  assert(/PASS/.test(r.out), '应打印 PASS');
+  assert(fs.existsSync(path.join(tmp4, 'AUTO-NOTE.md')), '验证通过后应把产物应用到真工作树');
+  assert(board4().includes('- [x] 生成自动笔记'), '任务应移入已完成');
+  assert(/auto:APPLIED/.test(handoff4()), 'handoff 应留 auto:APPLIED 记录');
+});
+check('auto: 空跑回执被拒 — 不应用、退回待办', () => {
+  const bad = path.join(tmp4, 'bad-dispatch.mjs');
+  fs.writeFileSync(bad, `import fs from 'node:fs';
+const rec = { task_id:'x', client:'Bad', model:'noop', transport:'mcp', tool_call_count:0, changes:[{path:'AUTO-NOTE2.md',content:'nope'}] };
+fs.writeFileSync(process.env.RELAY_RECEIPT_OUT, JSON.stringify(rec));
+`);
+  run4('board', 'add', '空跑任务');
+  const r = runSafe4('auto', '--task', '空跑任务', '--dispatch', `node ${bad}`, '--test', noteTest, '--model', 'noop');
+  assert(r.status === 1, '空跑应判 FAIL（退出码 1）：' + r.out);
+  assert(/存活检查|FAIL/.test(r.out), '应报告存活检查失败');
+  assert(!fs.existsSync(path.join(tmp4, 'AUTO-NOTE2.md')), '失败时绝不能应用产物');
+  assert(board4().includes('- [ ] 空跑任务'), '任务应退回待办');
+  assert(/auto:REJECTED/.test(handoff4()), 'handoff 应留 auto:REJECTED 记录');
+});
+check('auto: 待办为空时报错', () => {
+  const empty = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-test4e-'));
+  const re = (...a) => execFileSync(process.execPath, [BIN, ...a], { cwd: empty, encoding: 'utf8' });
+  re('init');
+  const r = (() => { try { re('auto', '--dispatch', `node ${ECHO}`); return { ok: true, out: '' }; } catch (e) { return { ok: false, out: (e.stdout || '') + (e.stderr || '') }; } })();
+  assert(!r.ok && /待办为空/.test(r.out), '待办为空应报错');
+  fs.rmSync(empty, { recursive: true, force: true });
+});
+check('auto: 缺 --dispatch 时报错', () => {
+  run4('board', 'add', '无派发器任务');
+  const r = runSafe4('auto', '--task', '无派发器任务');
+  assert(r.status === 1 && /--dispatch/.test(r.out), '缺 --dispatch 应报错并提示');
+});
+
 fs.rmSync(tmp, { recursive: true, force: true });
 fs.rmSync(tmp2, { recursive: true, force: true });
 fs.rmSync(tmp3, { recursive: true, force: true });
+fs.rmSync(tmp4, { recursive: true, force: true });
 if (failed) process.exit(1);
 console.log('all tests passed');

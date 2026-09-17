@@ -51,6 +51,7 @@ relay paste    # 生成整段粘贴模板，贴进对话即可，模型按固定
 | `relay brief [--tail N]` | 输出可粘贴的上下文简报 |
 | `relay paste` | 纯聊天客户端粘贴模板 |
 | `relay verify <receipt.json>` | 验证写回回执：存活检查 + 把产物应用到临时副本 + 跑测试，过/不过给退出码 |
+| `relay auto --dispatch <cmd>` | 无人值守闭环：取待办→派发给 headless 模型→收回执→verify→通过才应用并移板 |
 | `relay connect --client <name>` | 输出该客户端接入共享记忆 MCP 的配置 |
 
 ## 进阶：多客户端共享记忆（可选）
@@ -70,6 +71,38 @@ relay paste    # 生成整段粘贴模板，贴进对话即可，模型按固定
                     │ 豆包（粘贴 relay paste） │
                     └──────────────────────────┘
 ```
+
+## 进阶：无人值守 + 写回可验证
+
+多模型协作最大的风险是「模型嘴上说干完了，其实空跑」。`relay verify` + `relay auto` 把"信任"换成"验证"。
+
+**`relay verify <receipt.json>`** —— 验证门，做三件事，全过才 PASS（退出码 0）：
+
+1. **存活检查**：非 `paste` 回执必须 `tool_call_count > 0`，挡掉只回「OK」却零工具调用的静默失败
+2. **应用产物**：把回执 `changes` 写进项目的**临时副本**（拒绝 `..` 越界），不碰工作树
+3. **跑测试**：副本里执行测试命令（默认 `npm test`），绿了才算数
+
+回执 JSON 契约见 `.relay/PROTOCOL.md`。核心字段：`tool_call_count`、`transport`（`mcp`/`paste`）、`changes:[{path,content}]`。
+
+**`relay auto --dispatch <cmd>`** —— 在验证门之上串成无人值守闭环：
+
+```
+取一条待办 → 移「进行中」→ 渲染任务提示词 → 调用 <cmd>（headless 模型）
+   → 收回执 JSON → relay verify → PASS 才应用到工作树 + 移「已完成」
+                                  → FAIL 则不应用 + 退回「待办」 + 记录原因
+```
+
+派发器契约：`relay auto` 把任务提示词文件路径作为 argv 传给 `<cmd>`，并注入 `RELAY_RECEIPT_OUT`（回执写这里）、`RELAY_TASK_ID`、`RELAY_MODEL`、`RELAY_TIMEOUT`；`<cmd>` 产出回执 JSON 即可。
+
+```bash
+# 接真模型（OpenClaw headless，示例派发器已处理 --thinking off / 回执抽取）
+relay auto --dispatch "node examples/dispatch-openclaw.mjs" --model minimax/MiniMax-M2.7
+
+# 不接模型，先空跑看闭环（产出一个 AUTO-NOTE.md）
+relay auto --dispatch "node examples/dispatch-echo.mjs" --test "node -e \"process.exit(0)\""
+```
+
+要点：**只有 verify 跑通测试，auto 才会动你的工作树**；任何失败都原样退回待办并留痕，不会把半成品糊上去。
 
 ## 新手常见坑 → 接力棒怎么防
 
