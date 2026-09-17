@@ -86,6 +86,20 @@ relay auto --dispatch <cmd> [--task <kw>] [--model <m>] [--test <cmd>] [--timeou
 - 退出码语义不变：0 = PASS，1 = FAIL。CI 里直接可用。
 - 不给 `--json` 时，行为与 v0.1 完全一致（人类可读输出 + `handoff.md` 记录）。**只增不改。**
 
+### 5.1 独立复验：`relay recheck`
+
+```
+relay recheck [evidence.jsonl] [--project <dir>] [--rerun] [--allow-drift] [--json]
+```
+
+默认读 `.relay/evidence.jsonl`，做三件事，**不需要信任 agent-relay 本身**：
+
+1. **验链**：逐条重算 `chain.self`（稳定序列化 + SHA-256），并校验每条 `chain.prev` 与前一条 `self` 相连——改过任何一条都会报 `tamper` / `chain-break`；
+2. **查漂移**：每个路径只与「最新一条提到它的裁决」里的 `changes[].sha256` 比对，确认**落地的就是过门的那份**（文件被改过 → 报漂移，`--allow-drift` 可只报告不判失败）；
+3. **重跑**：`--rerun` 在当前工作树上重跑最后一条证据里的 `testCmd`，连同 `exitCode` / `outputSha256` 一起回报。
+
+链断 / 被篡改 / 漂移 / 重跑失败 → 退出码 1；`--json` 输出结构化报告（`{ok, entries, problems[], drift[], rerun}`）供 CI 消费。
+
 ## 6. 门策略版本（`gate.version`）
 
 - `gate.version` 是**策略版本**，不是包版本：裁决口径（阈值、检查集合、短路顺序）变了就 +1。
@@ -107,6 +121,14 @@ relay auto --dispatch <cmd> [--task <kw>] [--model <m>] [--test <cmd>] [--timeou
 
 ## 9. 路线图
 
-1. **本协议 v1**（本次）：receipt/verdict schema + `--json` + 证据链。
-2. **门抽成库**：`relay-gate`，让编排器直接调用（不做编排器，做编排器都要装的裁判）。
-3. **独立复验器**：`relay recheck <evidence.jsonl>`——不信任 agent-relay 的人也能一行命令验链、验哈希、重跑证据。
+1. **本协议 v1**（已完成）：receipt / verdict schema + `relay verify|auto --json` + 证据链。
+2. **门抽成库**（已完成）：`agent-relay/gate`（`lib/gate.mjs`，零依赖、**无副作用**，可被任意编排器 / CI 嵌入）。
+   CLI 与库共用同一份实现（`bin/relay.mjs` 从 `lib/gate.mjs` 导入），不会再出现「两套门」。
+
+   ```js
+   import { executeVerify, buildVerdict, snapshotTree, restoreTree, recheckEvidence } from 'agent-relay/gate';
+   ```
+
+3. **独立复验器**（已完成）：`relay recheck`——重算哈希链、比对工作树漂移、`--rerun` 重跑证据里的测试命令。
+4. **下一步**：把 `recheck` 做成 GitHub Action（每次 agent 产物提交时自动验链 + 重跑证据），
+   以及 `gate.version` 升级时的「老产物重审」流程。

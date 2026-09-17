@@ -176,6 +176,20 @@ gate{name,version,policy} + verdict + receipt.sha256 + changes[].sha256
 
 > 门防的是「老实但会出错的模型」，不防恶意；已知边界诚实列在 spec 第 8 节。
 
+**不信任接力棒也能验**——配了独立复验器：
+
+```bash
+relay recheck --rerun --json    # 重算哈希链 + 比对工作树漂移 + 重跑证据里的测试命令
+```
+
+**门同时是零依赖库**，编排器可以直接嵌（不做编排器，做编排器都要装的裁判）：
+
+```js
+import { executeVerify, buildVerdict, snapshotTree, recheckEvidence } from 'agent-relay/gate';
+```
+
+CLI 与库共用同一份实现（`bin/relay.mjs` 从 `lib/gate.mjs` 导入），不会有「两套门」。
+
 ## 调研来源（痛点出处）
 
 - [为什么你的 AI 编程助手会突然变傻？7 个坑一次讲透](https://m.toutiao.com/article/7670716914649350708/)

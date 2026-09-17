@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { executeVerify, isSensitivePath, checkNonCodeDestructive, isCodeFile, snapshotTree, restoreTree, capabilityTier, stableJson, sha256, GATE_VERSION } from '../bin/relay.mjs';
+import { executeVerify, isSensitivePath, checkNonCodeDestructive, isCodeFile, snapshotTree, restoreTree, capabilityTier, stableJson, sha256, GATE_VERSION, recheckEvidence } from '../lib/gate.mjs';
 
 const BIN = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'bin', 'relay.mjs');
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-test-'));
@@ -612,6 +612,61 @@ check('auto --json: 跑完打印裁决并追加证据', () => {
   assert(v.receipt.producer.tier === 'L1', 'echo 回执应判为 L1');
 });
 
+// 独立复验器 relay recheck：验链 / 查漂移 / 重跑
+const tmpR = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-test-recheck-'));
+const runR = (...args) => execFileSync(process.execPath, [BIN, ...args], { cwd: tmpR, encoding: 'utf8', env: { ...process.env, RELAY_WHO: 'tester' } });
+const runSafeR = (...args) => { try { return { ok: true, status: 0, out: runR(...args) }; } catch (e) { return { ok: false, status: e.status, out: (e.stdout || '') + (e.stderr || '') }; } };
+const evidencePathR = path.join(tmpR, '.relay', 'evidence.jsonl');
+
+check('recheck: 干净证据链 + 无漂移 → OK', () => {
+  runR('init');
+  runR('board', 'add', '复验任务');
+  const a = runSafeR('auto', '--task', '复验任务', '--dispatch', `node "${ECHO}"`, '--test', noteTest, '--model', 'none', '--json');
+  assert(a.status === 0, 'auto 应 PASS：' + a.out);
+  const r = runSafeR('recheck', '--json');
+  assert(r.status === 0, '干净链应 OK：' + r.out);
+  const rep = JSON.parse(r.out);
+  assert(rep.ok === true && rep.entries === 1, '报告应 ok 且 1 条：' + JSON.stringify(rep));
+  assert(rep.problems.length === 0 && rep.drift.length === 0, '不应有问题或漂移');
+});
+
+check('recheck: 落地文件被改 → 报漂移（--allow-drift 放行）', () => {
+  const landed = path.join(tmpR, 'AUTO-NOTE.md');
+  const original = fs.readFileSync(landed, 'utf8');
+  fs.writeFileSync(landed, original + '\n偷偷改一行\n');
+  const bad = runSafeR('recheck', '--json');
+  assert(bad.status === 1, '漂移应 FAIL');
+  const rep = JSON.parse(bad.out);
+  assert(rep.drift.length === 1 && rep.drift[0].path === 'AUTO-NOTE.md', '应报出漂移：' + JSON.stringify(rep.drift));
+  const lenient = runSafeR('recheck', '--json', '--allow-drift');
+  assert(lenient.status === 0 && JSON.parse(lenient.out).ok === true, '--allow-drift 应放行');
+  fs.writeFileSync(landed, original);
+});
+
+check('recheck: 篡改证据行 → 断链', () => {
+  const before = fs.readFileSync(evidencePathR, 'utf8');
+  fs.writeFileSync(evidencePathR, before.replace(/"self":"[0-9a-f]{64}"/, '"self":"' + '0'.repeat(64) + '"'));
+  const r = runSafeR('recheck', '--json');
+  assert(r.status === 1, '篡改应 FAIL：' + r.out);
+  const rep = JSON.parse(r.out);
+  assert(rep.problems.some((p) => p.kind === 'tamper'), '应报 tamper：' + JSON.stringify(rep.problems));
+  fs.writeFileSync(evidencePathR, before);
+});
+
+check('recheck: --rerun 重跑最后一次测试命令', () => {
+  const r = runSafeR('recheck', '--json', '--rerun');
+  assert(r.status === 0, '重跑应通过：' + r.out);
+  const rep = JSON.parse(r.out);
+  assert(rep.rerun && rep.rerun.exitCode === 0, '重跑应记录退出码 0：' + JSON.stringify(rep.rerun));
+});
+
+check('recheckEvidence: 纯函数即可复验（空文件/坏行不崩）', () => {
+  const empty = recheckEvidence('', {});
+  assert(empty.ok === true && empty.entries === 0, '空证据应视为干净：' + JSON.stringify(empty));
+  const broken = recheckEvidence('{ not json\n', {});
+  assert(broken.ok === false && broken.problems[0].kind === 'parse', '坏行应报 parse：' + JSON.stringify(broken));
+});
+
 // cleanup
 fs.rmSync(tmp, { recursive: true, force: true });
 fs.rmSync(tmp2, { recursive: true, force: true });
@@ -622,5 +677,6 @@ fs.rmSync(tmpG, { recursive: true, force: true });
 fs.rmSync(tmpPrune, { recursive: true, force: true });
 fs.rmSync(tmpLink, { recursive: true, force: true });
 fs.rmSync(tmpJ, { recursive: true, force: true });
+fs.rmSync(tmpR, { recursive: true, force: true });
 if (failed) process.exit(1);
 console.log('all tests passed');
