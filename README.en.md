@@ -26,6 +26,26 @@ server so multiple clients read and write one memory graph.
 | `relay auto --dispatch <cmd>` | Unattended loop: take a todo → dispatch to a headless model → verify the receipt → apply + move to done only on PASS, else revert |
 | `relay connect --client <name>` | Print shared-memory MCP config for the named client |
 
+## Local model fallback
+
+`--models` in `examples/auto-multi.mjs` lets you put a local Ollama model first and a cloud model as fallback:
+
+```bash
+node examples/auto-multi.mjs \
+  --models "ollama/qwen2.5:7b,minimax/MiniMax-M2.7" \
+  --dispatch "node examples/dispatch-openclaw.mjs"
+```
+
+The `relay` profile ships with a built-in `ollama` provider pointing to `127.0.0.1:11434`. Local models work offline without consuming cloud quota; cloud models kick in when local capacity is unavailable.
+
+**Failover & auth gotcha**: if a provider's credentials expire (e.g. MiniMax throws `No API key`), the verification gate rejects that model's receipt and `auto-multi` automatically falls through to the next model in the list. Re-authenticate with:
+
+```bash
+openclaw --profile relay models auth paste-api-key --provider <name>
+```
+
+Once re-authenticated, the next `auto-multi` run resumes normally.
+
 See README.md (Chinese) for the full guide, pitfall table, and pain-point sources.
 
 MIT

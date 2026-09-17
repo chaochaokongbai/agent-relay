@@ -72,6 +72,26 @@ relay paste    # 生成整段粘贴模板，贴进对话即可，模型按固定
                     └──────────────────────────┘
 ```
 
+## 本地模型落点（离线兜底）
+
+`examples/auto-multi.mjs` 的 `--models` 列表支持把本地 Ollama 模型放在第一位、云端模型作兜底。例如：
+
+```bash
+node examples/auto-multi.mjs \
+  --models "ollama/qwen2.5:7b,minimax/MiniMax-M2.7" \
+  --dispatch "node examples/dispatch-openclaw.mjs"
+```
+
+`relay profile` 已内置 `ollama` provider，指向 `127.0.0.1:11434`。本地模型无需网络、不消耗云端配额，离线可用；云端模型作为兜底，认证恢复后自动接管。
+
+**容灾与认证坑**：若某 provider 认证失效（如 MiniMax 报 `No API key`），验证门会拒绝该模型的回执，`auto-multi` 自动回退到列表下一个模型继续尝试。用户可用以下命令重认证：
+
+```bash
+openclaw --profile relay models auth paste-api-key --provider <name>
+```
+
+重认证完成后，下一轮 `auto-multi` 即可恢复正常。
+
 ## 进阶：无人值守 + 写回可验证
 
 多模型协作最大的风险是「模型嘴上说干完了，其实空跑」。`relay verify` + `relay auto` 把"信任"换成"验证"。
