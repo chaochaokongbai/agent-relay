@@ -48,7 +48,7 @@ check('isCodeFile: 正确识别代码文件', () => {
   assert(isCodeFile('a.js') === true, '.js 应为代码文件');
   assert(isCodeFile('a.cjs') === true, '.cjs 应为代码文件');
   assert(isCodeFile('a.ts') === true, '.ts 应为代码文件');
-  assert(isCodeFile('a.MJS') === false, '.MJS 大写非代码文件');
+  assert(isCodeFile('a.MJS') === true, '.MJS 大写按小写归一，应视为代码文件');
 });
 check('isCodeFile: 非代码文件', () => {
   assert(isCodeFile('a.md') === false, '.md 非代码文件');
