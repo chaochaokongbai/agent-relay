@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { executeVerify, isSensitivePath, checkNonCodeDestructive, isCodeFile } from '../bin/relay.mjs';
+import { executeVerify, isSensitivePath, checkNonCodeDestructive, isCodeFile, snapshotTree, restoreTree } from '../bin/relay.mjs';
 
 const BIN = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'bin', 'relay.mjs');
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-test-'));
@@ -75,6 +75,79 @@ check('checkNonCodeDestructive: 空白 trim 后相同不算删除', () => {
   const orig = '## 标题  \n内容  \n';
   const neo = '## 标题\n内容\n';
   assert(checkNonCodeDestructive(orig, neo) === null, 'trim后相同不算删除');
+});
+
+// --- snapshotTree / restoreTree 工作树守卫单元测试 ---
+const snapHas = (snap, k) => (snap instanceof Map ? snap.has(k) : Object.prototype.hasOwnProperty.call(snap, k));
+const snapGet = (snap, k) => (snap instanceof Map ? snap.get(k) : snap[k]);
+
+check('snapshotTree: 收录文本文件、排除 .git/.relay、键为正斜杠相对路径', () => {
+  const g = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-guard-snap-'));
+  fs.mkdirSync(path.join(g, 'sub'), { recursive: true });
+  fs.mkdirSync(path.join(g, '.git'), { recursive: true });
+  fs.mkdirSync(path.join(g, '.relay'), { recursive: true });
+  fs.mkdirSync(path.join(g, 'node_modules'), { recursive: true });
+  fs.writeFileSync(path.join(g, 'a.txt'), 'A\n');
+  fs.writeFileSync(path.join(g, 'sub', 'c.txt'), 'C\n');
+  fs.writeFileSync(path.join(g, '.git', 'HEAD'), 'ref: x\n');
+  fs.writeFileSync(path.join(g, '.relay', 'handoff.md'), '# 记录\n');
+  fs.writeFileSync(path.join(g, 'node_modules', 'dep.js'), 'dep\n');
+
+  const snap = snapshotTree(g);
+  assert(snapHas(snap, 'a.txt') && snapGet(snap, 'a.txt') === 'A\n', '应含 a.txt 原文');
+  assert(snapHas(snap, 'sub/c.txt') && snapGet(snap, 'sub/c.txt') === 'C\n', '键应为正斜杠相对路径');
+  assert(!snapHas(snap, '.git/HEAD'), '应排除 .git');
+  assert(!snapHas(snap, '.relay/handoff.md'), '应排除 .relay');
+  assert(!snapHas(snap, 'node_modules/dep.js'), '应排除 node_modules');
+  fs.rmSync(g, { recursive: true, force: true });
+});
+
+check('restoreTree: 直写被复原、被删文件重建、新增文件删除、子目录不受影响', () => {
+  const g = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-guard-restore-'));
+  fs.mkdirSync(path.join(g, 'sub'), { recursive: true });
+  fs.mkdirSync(path.join(g, '.relay'), { recursive: true });
+  fs.writeFileSync(path.join(g, 'a.txt'), 'A-原样\n');
+  fs.writeFileSync(path.join(g, 'b.txt'), 'B-原样\n');
+  fs.writeFileSync(path.join(g, 'sub', 'c.txt'), 'C-原样\n');
+  fs.writeFileSync(path.join(g, '.relay', 'handoff.md'), '# 记录\n');
+  const snap = snapshotTree(g);
+
+  // 三种漂移：改一个、删一个、新增一个（含子目录新增）
+  fs.writeFileSync(path.join(g, 'a.txt'), 'A-被直写覆盖\n');
+  fs.rmSync(path.join(g, 'b.txt'));
+  fs.writeFileSync(path.join(g, 'new.txt'), '直写新增\n');
+  fs.mkdirSync(path.join(g, 'newdir', 'deep'), { recursive: true });
+  fs.writeFileSync(path.join(g, 'newdir', 'deep', 'x.txt'), '深层新增\n');
+
+  const r = restoreTree(g, snap);
+  assert(fs.readFileSync(path.join(g, 'a.txt'), 'utf8') === 'A-原样\n', '被改文件应复原');
+  assert(fs.existsSync(path.join(g, 'b.txt')) && fs.readFileSync(path.join(g, 'b.txt'), 'utf8') === 'B-原样\n', '被删文件应重建且内容正确');
+  assert(fs.readFileSync(path.join(g, 'sub', 'c.txt'), 'utf8') === 'C-原样\n', '子目录文件不应受影响');
+  assert(!fs.existsSync(path.join(g, 'new.txt')), 'agent 新增文件应被删除');
+  assert(!fs.existsSync(path.join(g, 'newdir', 'deep', 'x.txt')), '子目录新增文件也应被删除');
+  assert(fs.readFileSync(path.join(g, '.relay', 'handoff.md'), 'utf8') === '# 记录\n', '.relay 不应被守卫触碰');
+  assert(r.restored.length >= 2 && r.deleted.length === 2 && r.failed.length === 0, '守卫应报告还原/删除计数且无失败：' + JSON.stringify(r));
+  fs.rmSync(g, { recursive: true, force: true });
+});
+
+check('restoreTree: 无漂移时是幂等空操作', () => {
+  const g = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-guard-idem-'));
+  fs.writeFileSync(path.join(g, 'x.txt'), 'x\n');
+  const snap = snapshotTree(g);
+  const r = restoreTree(g, snap);
+  assert(r.restored.length === 0 && r.deleted.length === 0 && r.failed.length === 0, '无漂移应无任何改动：' + JSON.stringify(r));
+  assert(fs.readFileSync(path.join(g, 'x.txt'), 'utf8') === 'x\n', '内容应保持');
+  fs.rmSync(g, { recursive: true, force: true });
+});
+
+check('restoreTree: 快照为空时清掉全部直写新增（不崩）', () => {
+  const g = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-guard-empty-'));
+  const snap = snapshotTree(g);
+  fs.writeFileSync(path.join(g, 'agent-wrote.txt'), '直写\n');
+  const r = restoreTree(g, snap);
+  assert(!fs.existsSync(path.join(g, 'agent-wrote.txt')), '应删除新增文件');
+  assert(r.failed.length === 0, '不应报失败：' + JSON.stringify(r));
+  fs.rmSync(g, { recursive: true, force: true });
 });
 
 // --- executeVerify 直接调用（严格模式）---
@@ -351,11 +424,61 @@ check('auto: 缺 --dispatch 时报错', () => {
   assert(r.status === 1 && /--dispatch/.test(r.out), '缺 --dispatch 应报错');
 });
 
+// 工作树守卫（round 13）：headless agent 带文件工具直写真工作树 → 派发后必须被还原
+const tmpG = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-test-guard-'));
+const runG = (...args) => execFileSync(process.execPath, [BIN, ...args], { cwd: tmpG, encoding: 'utf8', env: { ...process.env, RELAY_WHO: 'tester' } });
+const runSafeG = (...args) => { try { return { ok: true, status: 0, out: runG(...args) }; } catch (e) { return { ok: false, status: e.status, out: (e.stdout || '') + (e.stderr || '') }; } };
+const handoffG = () => fs.readFileSync(path.join(tmpG, '.relay', 'handoff.md'), 'utf8');
+// 测试命令在临时副本里跑：过门产物在、直写产物不在才算通过——守卫若失效，副本里会带上直写文件
+const guardTest = `node -e "const fs=require('fs');process.exit(fs.existsSync('GATED.txt') && !fs.existsSync('DIRECT.txt') ? 0 : 1)"`;
+
+check('auto 工作树守卫: 直写被还原、既有文件复原、被删文件重建、过门产物落地', () => {
+  runG('init');
+  fs.writeFileSync(path.join(tmpG, 'keep.txt'), '原样内容\n');
+  fs.writeFileSync(path.join(tmpG, 'gone.txt'), '要被删掉的文件\n');
+  runG('board', 'add', '守卫测试任务');
+  const d = path.join(tmpG, 'dispatch-direct.mjs');
+  fs.writeFileSync(d, [
+    "import fs from 'node:fs';",
+    '// 模拟带文件工具的 headless agent：直接写真工作树（cwd=root）',
+    "fs.writeFileSync('DIRECT.txt', '绕过门的直写');",
+    "fs.writeFileSync('keep.txt', '被直写覆盖');",
+    "fs.rmSync('gone.txt', { force: true });",
+    "const rec = { task_id:'x', client:'Guard', model:'test', transport:'mcp', tool_call_count:2, changes:[{path:'GATED.txt',content:'过门产物'}] };",
+    'fs.writeFileSync(process.env.RELAY_RECEIPT_OUT, JSON.stringify(rec));',
+    '',
+  ].join('\n'));
+  const r = runSafeG('auto', '--dispatch', `node "${d}"`, '--test', guardTest, '--model', 'test');
+  assert(r.status === 0, '应 PASS，实际 ' + r.status + '：' + r.out);
+  assert(!fs.existsSync(path.join(tmpG, 'DIRECT.txt')), 'agent 直写的新增文件必须被守卫删除');
+  assert(fs.readFileSync(path.join(tmpG, 'keep.txt'), 'utf8') === '原样内容\n', '被直写覆盖的既有文件必须复原');
+  assert(fs.readFileSync(path.join(tmpG, 'gone.txt'), 'utf8') === '要被删掉的文件\n', '被直写删除的文件必须重建');
+  assert(fs.existsSync(path.join(tmpG, 'GATED.txt')), '过门产物应落地到工作树');
+  assert(/auto:GUARD/.test(handoffG()), 'handoff 应留 auto:GUARD 记录');
+});
+
+check('auto 工作树守卫: 门 FAIL 时直写同样被还原', () => {
+  runG('board', 'add', '守卫失败路径任务');
+  const d = path.join(tmpG, 'dispatch-fail.mjs');
+  fs.writeFileSync(d, [
+    "import fs from 'node:fs';",
+    "fs.writeFileSync('DIRECT-FAIL.txt', '门挂了但直写还在？');",
+    "const rec = { task_id:'x', client:'Guard', model:'test', transport:'mcp', tool_call_count:0, changes:[{path:'GATED-FAIL.txt',content:'不该落地'}] };",
+    'fs.writeFileSync(process.env.RELAY_RECEIPT_OUT, JSON.stringify(rec));',
+    '',
+  ].join('\n'));
+  const r = runSafeG('auto', '--task', '守卫失败路径任务', '--dispatch', `node "${d}"`, '--test', guardTest, '--model', 'test');
+  assert(r.status === 1, '空跑应 FAIL：' + r.out);
+  assert(!fs.existsSync(path.join(tmpG, 'DIRECT-FAIL.txt')), '门 FAIL 时直写也必须被还原（round 13 核心）');
+  assert(!fs.existsSync(path.join(tmpG, 'GATED-FAIL.txt')), '未过门产物绝不能落地');
+});
+
 // cleanup
 fs.rmSync(tmp, { recursive: true, force: true });
 fs.rmSync(tmp2, { recursive: true, force: true });
 fs.rmSync(tmp3, { recursive: true, force: true });
 fs.rmSync(tmp4, { recursive: true, force: true });
 fs.rmSync(tmp4as, { recursive: true, force: true });
+fs.rmSync(tmpG, { recursive: true, force: true });
 if (failed) process.exit(1);
 console.log('all tests passed');

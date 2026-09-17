@@ -77,6 +77,8 @@ const HELP = `relay — 接力棒：给 AI Agent 会话一份持久工作记录
   manual 模式（verify）      放宽：允许改敏感路径，写审计日志
   非代码文件                按行判破坏：已存在文件若删除了原有非空行 → FAIL（纯增量放行）
   代码文件（.mjs/.js/.cjs）   维持 50% 字节阈值
+  工作树守卫                 auto 派发前对项目树快照、派发后无条件还原：agent 的直写与新增文件一律还原，
+                             只有过门 changes 才落地（排除 .git/node_modules/.relay）
 
 环境变量:
   RELAY_WHO    默认署名（如 "Qoder/claude"），等价于 --who
@@ -256,6 +258,60 @@ function cmdPaste(args) {
   cmdBrief(args);
   console.log = origLog;
   console.log(tpl.replace('{{BRIEF}}', brief.join('\n')));
+}
+
+// ---- 工作树守卫：auto 派发前后对项目树做快照/还原 ----
+// headless agent 带文件工具时会直接写真工作树（cwd=root），绕过验证门；且门 FAIL 时直写仍留存。
+// 快照 → 派发 → 无条件还原，保证 executeVerify 在干净基线上验证回执，只有过门 changes 能落地。
+const GUARD_EXCLUDE = new Set(['.git', 'node_modules', RELAY_DIR]);
+
+function walkFiles(dir, base, out) {
+  let entries;
+  try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return out; }
+  for (const ent of entries) {
+    if (GUARD_EXCLUDE.has(ent.name)) continue;
+    const abs = path.join(dir, ent.name);
+    if (ent.isDirectory()) walkFiles(abs, base, out);
+    else if (ent.isFile()) out.push(abs); // 符号链接 isFile() 为 false：不纳入快照，也不删
+  }
+  return out;
+}
+
+// 返回 Map：{相对路径（正斜杠）-> utf8 全文}
+function snapshotTree(dir) {
+  const root = path.resolve(dir);
+  const snap = new Map();
+  for (const abs of walkFiles(root, root, [])) {
+    const rel = normalizePath(path.relative(root, abs));
+    try { snap.set(rel, fs.readFileSync(abs, 'utf8')); } catch { /* 读不到则不纳入快照 */ }
+  }
+  return snap;
+}
+
+// 还原到快照：快照有而磁盘缺失/被改的 → 重写；磁盘有而快照没有的（agent 新建）→ 删除。
+// 返回 { restored, deleted, failed }（相对路径数组），调用方按需记录/告警。
+function restoreTree(dir, snapshot) {
+  const root = path.resolve(dir);
+  const restored = [];
+  const deleted = [];
+  const failed = [];
+  for (const [rel, content] of snapshot) {
+    const abs = path.resolve(root, rel);
+    let now = null;
+    try { now = fs.existsSync(abs) ? fs.readFileSync(abs, 'utf8') : null; } catch { now = null; }
+    if (now === content) continue;
+    try {
+      fs.mkdirSync(path.dirname(abs), { recursive: true });
+      fs.writeFileSync(abs, content);
+      restored.push(rel);
+    } catch (e) { failed.push(`${rel}（还原失败：${e.message}）`); }
+  }
+  for (const abs of walkFiles(root, root, [])) {
+    const rel = normalizePath(path.relative(root, abs));
+    if (snapshot.has(rel)) continue;
+    try { fs.rmSync(abs, { force: true }); deleted.push(rel); } catch (e) { failed.push(`${rel}（删除失败：${e.message}）`); }
+  }
+  return { restored, deleted, failed };
 }
 
 function applyChanges(destDir, changes) {
@@ -496,10 +552,28 @@ function cmdAuto(args) {
     const receiptOut = path.join(work, 'receipt.json');
     fs.writeFileSync(promptFile, renderPrompt(taskId, taskText, model));
     console.log(`relay auto: 派发任务「${taskText}」→ ${model || '默认模型'}（dispatch: ${dispatch}）`);
-    const d = spawnSync(dispatch, [promptFile], {
-      shell: true, cwd: root, encoding: 'utf8', timeout: timeout * 1000,
-      env: { ...process.env, RELAY_TASK_ID: taskId, RELAY_TASK_TEXT: taskText, RELAY_MODEL: model, RELAY_RECEIPT_OUT: receiptOut, RELAY_TIMEOUT: String(timeout) },
-    });
+    // 工作树守卫：派发前快照，派发后（无论成败/是否 dryRun）立即还原 agent 的直写与新增，
+    // 使 executeVerify 在干净基线上验证回执——只有过门的 changes 能落地。
+    const snap = snapshotTree(root);
+    let d;
+    try {
+      d = spawnSync(dispatch, [promptFile], {
+        shell: true, cwd: root, encoding: 'utf8', timeout: timeout * 1000,
+        env: { ...process.env, RELAY_TASK_ID: taskId, RELAY_TASK_TEXT: taskText, RELAY_MODEL: model, RELAY_RECEIPT_OUT: receiptOut, RELAY_TIMEOUT: String(timeout) },
+      });
+    } finally {
+      const guard = restoreTree(root, snap);
+      if (guard.restored.length || guard.deleted.length) {
+        console.log(`relay auto: 工作树守卫还原 ${guard.restored.length} 个直写、删除 ${guard.deleted.length} 个新增文件`);
+        record(`[auto:GUARD] 还原直写 ${guard.restored.length} 个、删除新增 ${guard.deleted.length} 个`
+          + (guard.restored.length ? `；还原：${guard.restored.join(', ')}` : '')
+          + (guard.deleted.length ? `；删除：${guard.deleted.join(', ')}` : ''));
+      }
+      if (guard.failed.length) {
+        console.error('relay auto: 工作树守卫未完全还原 — ' + guard.failed.join('；'));
+        record(`[auto:GUARD-WARN] 守卫未完全还原：${guard.failed.join('；')}`);
+      }
+    }
     let receiptRaw = fs.existsSync(receiptOut) ? fs.readFileSync(receiptOut, 'utf8').trim() : '';
     if (!receiptRaw) receiptRaw = (d.stdout || '').trim();
     let receipt = null;
@@ -610,4 +684,4 @@ switch (cmd) {
   default: fail(`未知命令 ${cmd}，运行 relay help`);
 }
 
-export { executeVerify, applyChanges, isSensitivePath, checkNonCodeDestructive, SENSITIVE_PATTERNS, isCodeFile };
+export { executeVerify, applyChanges, isSensitivePath, checkNonCodeDestructive, SENSITIVE_PATTERNS, isCodeFile, snapshotTree, restoreTree };
