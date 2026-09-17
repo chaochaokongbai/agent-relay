@@ -92,6 +92,21 @@ openclaw --profile relay models auth paste-api-key --provider <name>
 
 重认证完成后，下一轮 `auto-multi` 即可恢复正常。
 
+### 预检
+
+正式接入本地模型前，先用 probe 脚本验证该模型能否产出合格回执：
+
+```bash
+# 默认 model=qwen2.5-coder:7b，OLLAMA_BASE_URL 可覆盖
+node examples/probe-local.mjs <model>
+```
+
+它不经过 OpenClaw，直接向 Ollama 的 OpenAI 兼容接口发一个最小任务，
+用 `extractReceipt` 判定响应是否包含 `changes` 数组和非零 `tool_call_count`。
+
+- **PASS** → 该模型能产出合格回执，建议接入 `relay profile` 跑 `relay auto`
+- **FAIL** → 该本地模型不适合工具调用轮，不必浪费下载与显存
+
 ## 进阶：无人值守 + 写回可验证
 
 多模型协作最大的风险是「模型嘴上说干完了，其实空跑」。`relay verify` + `relay auto` 把"信任"换成"验证"。
