@@ -77,8 +77,8 @@ const HELP = `relay — 接力棒：给 AI Agent 会话一份持久工作记录
   manual 模式（verify）      放宽：允许改敏感路径，写审计日志
   非代码文件                按行判破坏：已存在文件若删除了原有非空行 → FAIL（纯增量放行）
   代码文件（.mjs/.js/.cjs）   维持 50% 字节阈值
-  工作树守卫                 auto 派发前对项目树快照、派发后无条件还原：agent 的直写与新增文件一律还原，
-                             只有过门 changes 才落地（排除 .git/node_modules/.relay）
+  工作树守卫                 auto 派发前对项目树快照、派发后无条件还原：agent 的直写、新增文件/符号链接、
+                              新建的空目录一律还原，只有过门 changes 才落地（排除 .git/node_modules/.relay）
 
 环境变量:
   RELAY_WHO    默认署名（如 "Qoder/claude"），等价于 --who
@@ -265,52 +265,136 @@ function cmdPaste(args) {
 // 快照 → 派发 → 无条件还原，保证 executeVerify 在干净基线上验证回执，只有过门 changes 能落地。
 const GUARD_EXCLUDE = new Set(['.git', 'node_modules', RELAY_DIR]);
 
+// 遍历项目树，分别收集普通文件、目录、符号链接的绝对路径。
+// 符号链接单独识别（ent.isSymbolicLink）且不跟随：不递归进链接目录、不当普通文件读内容。
 function walkFiles(dir, base, out) {
+  out = out || { files: [], dirs: [], symlinks: [] };
   let entries;
   try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return out; }
   for (const ent of entries) {
     if (GUARD_EXCLUDE.has(ent.name)) continue;
     const abs = path.join(dir, ent.name);
-    if (ent.isDirectory()) walkFiles(abs, base, out);
-    else if (ent.isFile()) out.push(abs); // 符号链接 isFile() 为 false：不纳入快照，也不删
+    if (ent.isSymbolicLink()) { out.symlinks.push(abs); continue; }
+    if (ent.isDirectory()) { out.dirs.push(abs); walkFiles(abs, base, out); }
+    else if (ent.isFile()) { out.files.push(abs); }
   }
   return out;
 }
 
-// 返回 Map：{相对路径（正斜杠）-> utf8 全文}
+const relOf = (root, abs) => normalizePath(path.relative(root, abs));
+
+// 返回 { files: Map<相对路径, utf8 全文>, dirs: Set<相对路径>, symlinks: Map<相对路径, readlink 目标> }
+// 目录集合用于区分「本来就有的空目录」与「agent 新建的目录」，避免误删有意保留的空目录。
 function snapshotTree(dir) {
   const root = path.resolve(dir);
-  const snap = new Map();
-  for (const abs of walkFiles(root, root, [])) {
-    const rel = normalizePath(path.relative(root, abs));
-    try { snap.set(rel, fs.readFileSync(abs, 'utf8')); } catch { /* 读不到则不纳入快照 */ }
+  const files = new Map();
+  const dirs = new Set();
+  const symlinks = new Map();
+  const cur = walkFiles(root, root);
+  for (const abs of cur.files) {
+    const rel = relOf(root, abs);
+    try { files.set(rel, fs.readFileSync(abs, 'utf8')); } catch { /* 读不到则不纳入快照 */ }
   }
-  return snap;
+  for (const abs of cur.dirs) dirs.add(relOf(root, abs));
+  for (const abs of cur.symlinks) {
+    const rel = relOf(root, abs);
+    try { symlinks.set(rel, fs.readlinkSync(abs)); } catch { /* 读不到链接目标则不纳入快照 */ }
+  }
+  return { files, dirs, symlinks };
+}
+
+// 兼容 round 13 的旧式 Map 快照：视作 files，dirs 由 files 键的祖先目录推导，symlinks 为空。
+function normalizeSnapshot(snapshot) {
+  if (snapshot instanceof Map) {
+    const dirs = new Set();
+    for (const rel of snapshot.keys()) {
+      const parts = normalizePath(rel).split('/');
+      parts.pop();
+      let acc = '';
+      for (const seg of parts) { acc = acc ? `${acc}/${seg}` : seg; dirs.add(acc); }
+    }
+    return { files: snapshot, dirs, symlinks: new Map() };
+  }
+  return {
+    files: (snapshot && snapshot.files) || new Map(),
+    dirs: (snapshot && snapshot.dirs) || new Set(),
+    symlinks: (snapshot && snapshot.symlinks) || new Map(),
+  };
 }
 
 // 还原到快照：快照有而磁盘缺失/被改的 → 重写；磁盘有而快照没有的（agent 新建）→ 删除。
+// 符号链接按 readlink 目标比对/重建；agent 新建的空目录自底向上剪枝，快照记录过的目录即使空也保留。
 // 返回 { restored, deleted, failed }（相对路径数组），调用方按需记录/告警。
 function restoreTree(dir, snapshot) {
   const root = path.resolve(dir);
+  const { files, dirs, symlinks } = normalizeSnapshot(snapshot);
   const restored = [];
   const deleted = [];
   const failed = [];
-  for (const [rel, content] of snapshot) {
+
+  // 1) 先清掉 agent 新建的符号链接与文件（先删链接，避免随后的还原顺着链接写到树外）
+  const before = walkFiles(root, root);
+  for (const abs of before.symlinks) {
+    const rel = relOf(root, abs);
+    if (symlinks.has(rel)) continue;
+    try { fs.rmSync(abs, { recursive: true, force: true }); deleted.push(rel); }
+    catch (e) { failed.push(`${rel}（符号链接删除失败：${e.message}）`); }
+  }
+  for (const abs of before.files) {
+    const rel = relOf(root, abs);
+    if (files.has(rel)) continue;
+    try { fs.rmSync(abs, { force: true }); deleted.push(rel); }
+    catch (e) { failed.push(`${rel}（删除失败：${e.message}）`); }
+  }
+
+  // 2) 重建 agent 删掉的快照目录（快照记录过的目录即使空也保留）
+  for (const rel of dirs) {
     const abs = path.resolve(root, rel);
+    if (fs.existsSync(abs)) continue;
+    try { fs.mkdirSync(abs, { recursive: true }); restored.push(rel); }
+    catch (e) { failed.push(`${rel}（目录重建失败：${e.message}）`); }
+  }
+
+  // 3) 还原快照里的普通文件；该路径若被换成符号链接，先摘链再写，避免写到链接指向的树外
+  for (const [rel, content] of files) {
+    const abs = path.resolve(root, rel);
+    let isLink = false;
     let now = null;
-    try { now = fs.existsSync(abs) ? fs.readFileSync(abs, 'utf8') : null; } catch { now = null; }
-    if (now === content) continue;
+    try {
+      isLink = fs.lstatSync(abs).isSymbolicLink();
+      now = isLink ? null : fs.readFileSync(abs, 'utf8');
+    } catch { now = null; }
+    if (!isLink && now === content) continue;
     try {
       fs.mkdirSync(path.dirname(abs), { recursive: true });
+      if (isLink) fs.rmSync(abs, { force: true });
       fs.writeFileSync(abs, content);
       restored.push(rel);
     } catch (e) { failed.push(`${rel}（还原失败：${e.message}）`); }
   }
-  for (const abs of walkFiles(root, root, [])) {
-    const rel = normalizePath(path.relative(root, abs));
-    if (snapshot.has(rel)) continue;
-    try { fs.rmSync(abs, { force: true }); deleted.push(rel); } catch (e) { failed.push(`${rel}（删除失败：${e.message}）`); }
+
+  // 4) 还原快照里的符号链接：缺失或目标变了 → 重建
+  for (const [rel, target] of symlinks) {
+    const abs = path.resolve(root, rel);
+    let now = null;
+    try { now = fs.readlinkSync(abs); } catch { now = null; }
+    if (now === target) continue;
+    try {
+      fs.mkdirSync(path.dirname(abs), { recursive: true });
+      fs.rmSync(abs, { recursive: true, force: true });
+      fs.symlinkSync(target, abs);
+      restored.push(rel);
+    } catch (e) { failed.push(`${rel}（符号链接还原失败：${e.message}）`); }
   }
+
+  // 5) 自底向上剪掉「不在快照目录集合里、且此刻已空」的目录；快照记录过的目录不误删
+  const extraDirs = walkFiles(root, root).dirs.map((abs) => relOf(root, abs)).filter((rel) => !dirs.has(rel));
+  extraDirs.sort((a, b) => b.split('/').length - a.split('/').length);
+  for (const rel of extraDirs) {
+    try { fs.rmdirSync(path.resolve(root, rel)); deleted.push(rel); }
+    catch { /* 非空或不可删：保留，不算失败 */ }
+  }
+
   return { restored, deleted, failed };
 }
 

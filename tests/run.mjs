@@ -78,8 +78,8 @@ check('checkNonCodeDestructive: 空白 trim 后相同不算删除', () => {
 });
 
 // --- snapshotTree / restoreTree 工作树守卫单元测试 ---
-const snapHas = (snap, k) => (snap instanceof Map ? snap.has(k) : Object.prototype.hasOwnProperty.call(snap, k));
-const snapGet = (snap, k) => (snap instanceof Map ? snap.get(k) : snap[k]);
+const snapHas = (snap, k) => snap.files.has(k);
+const snapGet = (snap, k) => snap.files.get(k);
 
 check('snapshotTree: 收录文本文件、排除 .git/.relay、键为正斜杠相对路径', () => {
   const g = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-guard-snap-'));
@@ -99,6 +99,9 @@ check('snapshotTree: 收录文本文件、排除 .git/.relay、键为正斜杠�
   assert(!snapHas(snap, '.git/HEAD'), '应排除 .git');
   assert(!snapHas(snap, '.relay/handoff.md'), '应排除 .relay');
   assert(!snapHas(snap, 'node_modules/dep.js'), '应排除 node_modules');
+  assert(snap.dirs.has('sub'), '快照应记录已存在目录（供空目录剪枝用）');
+  assert(!snap.dirs.has('.git') && !snap.dirs.has('.relay') && !snap.dirs.has('node_modules'), '目录集合应排除 .git/.relay/node_modules');
+  assert(snap.symlinks.size === 0, '无符号链接时 symlinks 应为空 Map');
   fs.rmSync(g, { recursive: true, force: true });
 });
 
@@ -126,7 +129,9 @@ check('restoreTree: 直写被复原、被删文件重建、新增文件删除、
   assert(!fs.existsSync(path.join(g, 'new.txt')), 'agent 新增文件应被删除');
   assert(!fs.existsSync(path.join(g, 'newdir', 'deep', 'x.txt')), '子目录新增文件也应被删除');
   assert(fs.readFileSync(path.join(g, '.relay', 'handoff.md'), 'utf8') === '# 记录\n', '.relay 不应被守卫触碰');
-  assert(r.restored.length >= 2 && r.deleted.length === 2 && r.failed.length === 0, '守卫应报告还原/删除计数且无失败：' + JSON.stringify(r));
+  assert(r.restored.length >= 2 && r.failed.length === 0, '守卫应报告还原计数且无失败：' + JSON.stringify(r));
+  assert(r.deleted.includes('new.txt') && r.deleted.includes('newdir/deep/x.txt'), 'agent 新增文件应被删除：' + JSON.stringify(r));
+  assert(r.deleted.includes('newdir/deep') && r.deleted.includes('newdir'), 'round 14 (a)：agent 新建的空目录应被剪枝：' + JSON.stringify(r));
   fs.rmSync(g, { recursive: true, force: true });
 });
 
@@ -148,6 +153,56 @@ check('restoreTree: 快照为空时清掉全部直写新增（不崩）', () => 
   assert(!fs.existsSync(path.join(g, 'agent-wrote.txt')), '应删除新增文件');
   assert(r.failed.length === 0, '不应报失败：' + JSON.stringify(r));
   fs.rmSync(g, { recursive: true, force: true });
+});
+
+// round 14 (a)：agent 新建的空目录要剪枝，快照里已有的空目录要保留
+const tmpPrune = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-guard-prune-'));
+check('restoreTree: agent 新建的空目录自底向上剪枝、预存空目录保留', () => {
+  fs.mkdirSync(path.join(tmpPrune, 'keepempty'), { recursive: true });
+  fs.mkdirSync(path.join(tmpPrune, 'full'), { recursive: true });
+  fs.writeFileSync(path.join(tmpPrune, 'full', 'f.txt'), 'F\n');
+  const snap = snapshotTree(tmpPrune);
+  assert(snap.dirs.has('keepempty') && snap.dirs.has('full'), '快照应记录已存在目录：' + JSON.stringify([...snap.dirs]));
+
+  // 模拟 agent：新建深层目录并写入文件，还删掉一个快照里的目录
+  fs.mkdirSync(path.join(tmpPrune, 'newdir', 'deep'), { recursive: true });
+  fs.writeFileSync(path.join(tmpPrune, 'newdir', 'deep', 'x.txt'), 'X\n');
+  fs.rmSync(path.join(tmpPrune, 'full'), { recursive: true, force: true });
+
+  const r = restoreTree(tmpPrune, snap);
+  assert(!fs.existsSync(path.join(tmpPrune, 'newdir', 'deep', 'x.txt')), 'x.txt 应被删除');
+  assert(!fs.existsSync(path.join(tmpPrune, 'newdir', 'deep')), 'newdir/deep 应被剪掉');
+  assert(!fs.existsSync(path.join(tmpPrune, 'newdir')), 'newdir 应被剪掉');
+  assert(fs.existsSync(path.join(tmpPrune, 'keepempty')), '预存空目录不应被误删');
+  assert(fs.readFileSync(path.join(tmpPrune, 'full', 'f.txt'), 'utf8') === 'F\n', 'agent 删掉的快照目录应被重建（含目录内文件）');
+  assert(r.deleted.includes('newdir/deep') && r.deleted.includes('newdir'), '剪掉的空目录应计入 deleted：' + JSON.stringify(r));
+  assert(r.failed.length === 0, '不应报失败：' + JSON.stringify(r));
+});
+
+// round 14 (c)：符号链接纳入快照，按目标还原；agent 新建的符号链接删除
+const tmpLink = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-guard-link-'));
+check('restoreTree: 符号链接按目标还原、agent 新建链接被删除', () => {
+  fs.writeFileSync(path.join(tmpLink, 'a.txt'), 'A\n');
+  try {
+    fs.symlinkSync('a.txt', path.join(tmpLink, 'link.txt'));
+  } catch (e) {
+    console.log('skip 符号链接还原测试（当前平台不允许创建符号链接：' + (e.code || e.message) + '）');
+    return;
+  }
+  const snap = snapshotTree(tmpLink);
+  assert(snap.symlinks.get('link.txt') === 'a.txt', '符号链接应以相对路径 → 目标入快照：' + JSON.stringify([...snap.symlinks]));
+
+  // 模拟 agent：把 link.txt 改指别处，并新建一个符号链接
+  fs.rmSync(path.join(tmpLink, 'link.txt'), { force: true });
+  fs.symlinkSync('b.txt', path.join(tmpLink, 'link.txt'));
+  fs.symlinkSync('a.txt', path.join(tmpLink, 'evil'));
+
+  const r = restoreTree(tmpLink, snap);
+  assert(fs.readlinkSync(path.join(tmpLink, 'link.txt')) === 'a.txt', '符号链接目标应复原为 a.txt');
+  assert(!fs.existsSync(path.join(tmpLink, 'evil')), 'agent 新建的符号链接应被删除');
+  assert(r.deleted.includes('evil'), '被删链接应计入 deleted：' + JSON.stringify(r));
+  assert(fs.readFileSync(path.join(tmpLink, 'a.txt'), 'utf8') === 'A\n', '链接目标文件应原样保留');
+  assert(r.failed.length === 0, '不应报失败：' + JSON.stringify(r));
 });
 
 // --- executeVerify 直接调用（严格模式）---
@@ -480,5 +535,7 @@ fs.rmSync(tmp3, { recursive: true, force: true });
 fs.rmSync(tmp4, { recursive: true, force: true });
 fs.rmSync(tmp4as, { recursive: true, force: true });
 fs.rmSync(tmpG, { recursive: true, force: true });
+fs.rmSync(tmpPrune, { recursive: true, force: true });
+fs.rmSync(tmpLink, { recursive: true, force: true });
 if (failed) process.exit(1);
 console.log('all tests passed');
