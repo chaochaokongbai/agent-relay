@@ -10,7 +10,7 @@ to resume instead of restart; `relay paste` covers chat-only clients (e.g. Douba
 `relay connect --client <name>` prints ready-to-use config for a shared-memory MCP
 server so multiple clients read and write one memory graph.
 
-## Commands (13 checks via `npm test`)
+## Commands (17 checks via `npm test`)
 
 | Command | Effect |
 |---|---|
@@ -22,6 +22,7 @@ server so multiple clients read and write one memory graph.
 | `relay board done --index <n>` | Complete the nth todo by order (1-based) |
 | `relay brief [--tail N]` | Output pasteable context brief (default N=15) |
 | `relay paste` | Paste template for chat-only clients |
+| `relay verify <receipt.json>` | Verify a write-back receipt: liveness check + apply artifacts to a temp copy + run tests; exit code = pass/fail |
 | `relay connect --client <name>` | Print shared-memory MCP config for the named client |
 
 See README.md (Chinese) for the full guide, pitfall table, and pain-point sources.

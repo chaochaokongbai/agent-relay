@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
+import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -18,6 +20,9 @@ const HELP = `relay — 接力棒：给 AI Agent 会话一份持久工作记录
   relay board done --index <n>  按待办顺序（1 基）精确完成第 n 条
   relay brief [--tail N]        输出可粘贴进新会话/新客户端的上下文简报（默认 N=15）
   relay paste                   输出纯聊天客户端（豆包等）用的粘贴模板
+  relay verify <receipt.json>   验证一份写回回执：存活检查 + 把产物应用到项目临时副本 + 跑测试
+                                [--project <dir>] [--test <cmd>] [--no-record]
+                                退出码 0=PASS，1=FAIL，并在 handoff.md 留一条带署名的验证记录
   relay connect --client <name> 输出该客户端接入共享记忆 MCP 的配置
                                 name: qoder | workbuddy | openclaw | dsh | doubao
   relay help                    本帮助
@@ -201,6 +206,87 @@ function cmdPaste(args) {
   console.log(tpl.replace('{{BRIEF}}', brief.join('\n')));
 }
 
+function executeVerify(receipt, project, testCmd) {
+  const isPaste = receipt.transport === 'paste';
+  if (!isPaste) {
+    const tcc = receipt.tool_call_count;
+    if (!Number.isInteger(tcc) || tcc <= 0) {
+      return { ok: false, reason: `存活检查未通过：tool_call_count=${JSON.stringify(tcc)}（疑似空跑/静默失败，比如只回「OK」）`, detail: '' };
+    }
+  }
+  const changes = Array.isArray(receipt.changes) ? receipt.changes : null;
+  if (!changes || !changes.length) {
+    return { ok: false, reason: '回执里没有 changes 数组，无产物可验证', detail: '' };
+  }
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-verify-'));
+  try {
+    fs.cpSync(project, temp, {
+      recursive: true,
+      filter: (src) => { const b = path.basename(src); return b !== '.git' && b !== 'node_modules'; },
+    });
+    for (const c of changes) {
+      if (!c || typeof c.path !== 'string' || typeof c.content !== 'string') {
+        return { ok: false, reason: 'changes 条目非法（每条需要 {path, content} 两个字符串字段）', detail: '' };
+      }
+      const dest = path.resolve(temp, c.path);
+      const rel = path.relative(temp, dest);
+      if (rel.startsWith('..') || path.isAbsolute(rel)) {
+        return { ok: false, reason: `拒绝越界写入（path 逃出项目目录）：${c.path}`, detail: '' };
+      }
+      fs.mkdirSync(path.dirname(dest), { recursive: true });
+      fs.writeFileSync(dest, c.content);
+    }
+    const r = spawnSync(testCmd, { shell: true, cwd: temp, encoding: 'utf8' });
+    const detail = ((r.stdout || '') + (r.stderr || '')).trim();
+    const ok = r.status === 0;
+    return {
+      ok,
+      reason: ok ? `验证通过：产物已应用到临时副本，测试命令 \`${testCmd}\` 退出码 0` : `验证失败：测试命令 \`${testCmd}\` 退出码 ${r.status}`,
+      detail,
+    };
+  } catch (e) {
+    return { ok: false, reason: '验证过程异常：' + e.message, detail: '' };
+  } finally {
+    fs.rmSync(temp, { recursive: true, force: true });
+  }
+}
+
+function conclude(relay, receipt, res, noRecord) {
+  const tag = res.ok ? 'PASS' : 'FAIL';
+  console.log(`relay verify: ${tag} — ${res.reason}`);
+  if (res.detail) {
+    const shown = res.detail.split('\n').slice(-20).join('\n');
+    console.log('---- 测试输出（末尾 20 行）----\n' + shown);
+  }
+  if (!noRecord) {
+    const author = `${receipt.client || '?'}/${receipt.model || '?'}`;
+    const task = receipt.task_id || '?';
+    fs.appendFileSync(path.join(relay, 'handoff.md'), `- [${stamp()}] [verify:${tag}] task=${task} by=${author} ${res.reason}\n`);
+  }
+  process.exit(res.ok ? 0 : 1);
+}
+
+function cmdVerify(args) {
+  const root = rootOrFail();
+  const relay = path.join(root, RELAY_DIR);
+  const receiptPath = args.shift();
+  if (!receiptPath) fail('verify 需要回执文件：relay verify <receipt.json> [--project <dir>] [--test <cmd>] [--no-record]');
+  const projectArg = flag(args, '--project');
+  const testArg = flag(args, '--test');
+  const noRecord = args.includes('--no-record');
+  const project = path.resolve(projectArg || root);
+
+  let receipt;
+  try {
+    receipt = JSON.parse(fs.readFileSync(path.resolve(receiptPath), 'utf8'));
+  } catch (e) {
+    return conclude(relay, {}, { ok: false, reason: '回执读取/解析失败：' + e.message, detail: '' }, noRecord);
+  }
+  const meta = JSON.parse(read(path.join(relay, 'relay.json')) || '{}');
+  const testCmd = testArg || (meta.verify && meta.verify.test) || 'npm test';
+  conclude(relay, receipt, executeVerify(receipt, project, testCmd), noRecord);
+}
+
 function memServerSnippet(root) {
   const memFile = path.join(root, RELAY_DIR, 'memory.jsonl').replace(/\\/g, '/');
   return { memFile, npx: ['npx', '-y', '@modelcontextprotocol/server-memory'] };
@@ -257,6 +343,7 @@ switch (cmd) {
   case 'board': cmdBoard(rest); break;
   case 'brief': cmdBrief(rest); break;
   case 'paste': cmdPaste(rest); break;
+  case 'verify': cmdVerify(rest); break;
   case 'connect': cmdConnect(rest); break;
   case 'help': case undefined: case '--help': case '-h': console.log(HELP); break;
   default: fail(`未知命令 ${cmd}，运行 relay help`);

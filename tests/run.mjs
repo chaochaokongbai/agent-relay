@@ -124,7 +124,56 @@ check('done: 缩进子任务也能识别', () => {
   assert(board2().includes('- [x] 缩进的子任务'), '缩进子任务应被标记完成');
 });
 
+// 验证门：relay verify（存活检查 + 应用产物到临时副本 + 跑测试）
+const tmp3 = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-test3-'));
+const run3 = (...args) => execFileSync(process.execPath, [BIN, ...args], { cwd: tmp3, encoding: 'utf8', env: { ...process.env, RELAY_WHO: 'tester' } });
+const runSafe3 = (...args) => { try { return { ok: true, status: 0, out: run3(...args) }; } catch (e) { return { ok: false, status: e.status, out: (e.stdout || '') + (e.stderr || '') }; } };
+const writeReceipt = (name, obj) => { const p = path.join(tmp3, name); fs.writeFileSync(p, JSON.stringify(obj)); return name; };
+const existsTest = `node -e "process.exit(require('fs').existsSync('probe.txt')?0:1)"`;
+
+check('verify: PASS — 产物应用且测试通过', () => {
+  run3('init');
+  const rec = writeReceipt('ok.json', {
+    task_id: 'relay-task-x', client: 'TestClient', model: 'test-model',
+    tool_call_count: 3, changes: [{ path: 'probe.txt', content: 'hi' }],
+  });
+  const r = runSafe3('verify', rec, '--project', tmp3, '--test', existsTest);
+  assert(r.status === 0, 'PASS 时退出码应为 0，实际 ' + r.status + ' 输出: ' + r.out);
+  assert(/PASS/.test(r.out), '应打印 PASS');
+  const handoff = fs.readFileSync(path.join(tmp3, '.relay', 'handoff.md'), 'utf8');
+  assert(/verify:PASS/.test(handoff) && /TestClient\/test-model/.test(handoff), '应在 handoff.md 留带署名的 PASS 记录');
+});
+check('verify: FAIL — 存活检查拦截 tool_call_count=0（空跑）', () => {
+  const rec = writeReceipt('dead.json', {
+    task_id: 'relay-task-x', client: 'MiniMax', model: 'M2.7',
+    tool_call_count: 0, changes: [{ path: 'probe.txt', content: 'hi' }],
+  });
+  const r = runSafe3('verify', rec, '--project', tmp3, '--test', existsTest, '--no-record');
+  assert(r.status === 1, '空跑应判 FAIL（退出码 1）');
+  assert(/存活检查/.test(r.out), '应报告存活检查未通过');
+});
+check('verify: FAIL — 测试命令退出非 0', () => {
+  const rec = writeReceipt('bad.json', {
+    task_id: 'relay-task-x', client: 'TestClient', model: 'test-model',
+    tool_call_count: 2, changes: [{ path: 'probe.txt', content: 'hi' }],
+  });
+  const r = runSafe3('verify', rec, '--project', tmp3, '--test', 'node -e "process.exit(1)"', '--no-record');
+  assert(r.status === 1, '测试失败应判 FAIL');
+  assert(/验证失败/.test(r.out), '应报告验证失败');
+});
+check('verify: FAIL — 拒绝越界写入', () => {
+  const rec = writeReceipt('evil.json', {
+    task_id: 'relay-task-x', client: 'TestClient', model: 'test-model',
+    tool_call_count: 2, changes: [{ path: '../evil.txt', content: 'pwn' }],
+  });
+  const r = runSafe3('verify', rec, '--project', tmp3, '--test', existsTest, '--no-record');
+  assert(r.status === 1, '越界写入应判 FAIL');
+  assert(/越界/.test(r.out), '应报告拒绝越界写入');
+  assert(!fs.existsSync(path.join(path.dirname(tmp3), 'evil.txt')), '不应真的写出越界文件');
+});
+
 fs.rmSync(tmp, { recursive: true, force: true });
 fs.rmSync(tmp2, { recursive: true, force: true });
+fs.rmSync(tmp3, { recursive: true, force: true });
 if (failed) process.exit(1);
 console.log('all tests passed');
