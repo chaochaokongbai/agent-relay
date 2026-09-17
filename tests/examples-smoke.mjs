@@ -5,6 +5,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { extractReceipt } from '../examples/dispatch-openclaw.mjs';
 
 const ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url))); // tests/smoke.mjs → tests/ → 仓库根
 
@@ -65,6 +66,27 @@ const fail = (msg) => {
     fail(`changes[0].path 应为非空字符串，实际 ${JSON.stringify(rec.changes[0]?.path)}`);
 
   fs.unlinkSync(tmpFile);
+  passed++;
+}
+
+// (5) extractReceipt：正文自带示例 json 块时仍应取到真回执，而非第一个围栏
+{
+  const real = JSON.stringify({ task_id: 't', client: 'c', model: 'm', transport: 'mcp', tool_call_count: 3, files_read: [], changes: [{ path: 'a.md', content: 'x' }] });
+  const decoy = JSON.stringify({ example: 'not a receipt', models: ['ollama/qwen2.5:7b'] });
+
+  const withDecoyFirst = '说明如下：\n```json\n' + decoy + '\n```\n回执：\n```json\n' + real + '\n```\n';
+  const got = extractReceipt(withDecoyFirst);
+  if (!got || JSON.parse(got).tool_call_count !== 3)
+    fail('extractReceipt 应跳过示例 json 块、取到真回执');
+  passed++;
+
+  if (extractReceipt('只有示例：\n```json\n' + decoy + '\n```\n') !== null)
+    fail('extractReceipt 对无合格回执的文本应返回 null');
+  passed++;
+
+  const loose = extractReceipt('无围栏回执 ' + real + ' 结束');
+  if (!loose || JSON.parse(loose).tool_call_count !== 3)
+    fail('extractReceipt 应支持无围栏的松散回执');
   passed++;
 }
 
