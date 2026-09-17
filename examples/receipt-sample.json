@@ -1,0 +1,14 @@
+{
+  "task_id": "relay-task-x",
+  "client": "OpenClaw",
+  "model": "MiniMax-M2.7",
+  "transport": "mcp",
+  "tool_call_count": 3,
+  "files_read": ["bin/relay.mjs", "tests/run.mjs"],
+  "changes": [
+    {
+      "path": "probe.txt",
+      "content": "hi\n"
+    }
+  ]
+}

@@ -16,23 +16,27 @@ const model = process.env.RELAY_MODEL || 'minimax/MiniMax-M2.7';
 const timeout = process.env.RELAY_TIMEOUT || '600';
 
 // MiniMax-M2.7 必须 --thinking off 才会发起 tool call；隔离 profile 避开正在运行的 Gateway。
+// shell:true 是 Windows 必需——openclaw 是 npm 的 .cmd shim，不加 shell 无法被 spawn 解析。
 const r = spawnSync('openclaw', [
   '--profile', 'relay', 'agent', '--local',
   '--model', model, '--thinking', 'off',
   '--message-file', promptFile, '--json', '--timeout', timeout,
-], { encoding: 'utf8' });
+], { encoding: 'utf8', shell: true });
 
 if (r.status !== 0) {
-  console.error('dispatch-openclaw: openclaw 退出码 ' + r.status + '\n' + (r.stderr || ''));
+  const why = r.error ? r.error.message : '退出码 ' + r.status;
+  console.error('dispatch-openclaw: openclaw 失败（' + why + '）\n' + (r.stderr || ''));
   process.exit(1);
 }
 
-// openclaw --json 是个信封；模型回执应在 reply 文本里以 ```json 围栏包裹。
-let text = r.stdout || '';
+// openclaw --json 是个信封：{payloads:[{text}], meta:{...}}；模型回执应在文本里以 ```json 围栏包裹。
+let text = '';
 try {
   const env = JSON.parse(r.stdout);
-  text = env.reply || env.message || env.text || r.stdout;
-} catch { /* 不是 JSON 信封就按纯文本处理 */ }
+  if (Array.isArray(env.payloads)) text = env.payloads.map((p) => (p && p.text) || '').join('\n');
+  else text = env.reply || env.message || env.text || '';
+  if (!text) text = r.stdout;
+} catch { text = r.stdout || ''; }
 
 const fenced = String(text).match(/```json\s*([\s\S]*?)```/);
 const loose = String(text).match(/\{[\s\S]*"changes"[\s\S]*\}/);
