@@ -1,0 +1,79 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/chaochaokongbai/agent-relay/spec/receipt.schema.json",
+  "title": "agent-relay 回执 receipt",
+  "description": "跨客户端/跨厂商模型交回产物的统一信封。门（admission gate）只认这个形状；厂商、框架、语言都不进协议，只进 producer 描述字段。",
+  "type": "object",
+  "required": ["changes"],
+  "properties": {
+    "task_id": {
+      "type": "string",
+      "description": "产出方的任务标识（通常来自 .relay/board.md 或编排器生成的 auto-<ts>）"
+    },
+    "client": { "type": "string", "description": "客户端名，如 Qoder / DSH / OpenClaw / 豆包（自由文本，仅用于署名与审计）" },
+    "model": { "type": "string", "description": "模型名，如 deepseek-v4-flash / claude-sonnet / minimax-m2（自由文本，仅用于署名与审计）" },
+    "transport": {
+      "enum": ["mcp", "paste", "file", "cli"],
+      "description": "产物怎么送回来的。paste = 人工从纯聊天客户端复制粘贴（对应能力分级 L0）；mcp/cli = 有工具通道"
+    },
+    "capabilities": {
+      "type": "array",
+      "items": { "enum": ["files", "exec", "network", "vision"] },
+      "description": "产出方声明的能力。空/缺省 = 只能产出文本（L0）；含 files = L1；含 exec = L2。门按能力分级裁决，而不是一刀切拒绝弱客户端。"
+    },
+    "tool_call_count": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "产出方本次真实发起的工具调用次数。存活检查依据：非 paste 通道必须为正整数；0/缺失视为空跑（round 4 的教训：模型只回「OK」也算交付）。"
+    },
+    "files_read": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "产出方声称读过的文件（审计用，门不校验其真实性，只做留痕）"
+    },
+    "changes": {
+      "type": "array",
+      "minItems": 1,
+      "description": "产物：每条是「完整文件内容」，不是 diff 片段。空数组合法但会被门拒绝（无产物可验证）。",
+      "items": {
+        "type": "object",
+        "required": ["path", "content"],
+        "properties": {
+          "path": { "type": "string", "description": "相对项目根的路径（正反斜杠都接受，比较前归一化）" },
+          "content": { "type": "string", "description": "该文件修改后的完整内容" }
+        },
+        "additionalProperties": true
+      }
+    },
+    "parent_receipt": {
+      "type": "string",
+      "description": "可选。上一轮裁决的 chain.self（或回执 sha256），多轮接力时自己也能形成链"
+    },
+    "notes": { "type": "string", "description": "可选。产出方给人类看的备注，门不看" }
+  },
+  "additionalProperties": true,
+  "examples": [
+    {
+      "task_id": "auto-1789480000000",
+      "client": "DSH",
+      "model": "deepseek-v4-flash",
+      "transport": "mcp",
+      "capabilities": ["files"],
+      "tool_call_count": 7,
+      "files_read": ["bin/relay.mjs", "tests/run.mjs"],
+      "changes": [
+        { "path": "docs/EXAMPLE.md", "content": "# 示例\n\n完整全文，不是 diff。\n" }
+      ]
+    },
+    {
+      "task_id": "paste-42",
+      "client": "豆包",
+      "model": "doubao-pro",
+      "transport": "paste",
+      "capabilities": [],
+      "changes": [
+        { "path": "docs/PASTE.RESULT.md", "content": "# 纯聊天客户端交付\n" }
+      ]
+    }
+  ]
+}

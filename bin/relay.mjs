@@ -2,6 +2,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
@@ -60,13 +61,15 @@ const HELP = `relay — 接力棒：给 AI Agent 会话一份持久工作记录
   relay brief [--tail N]        输出可粘贴进新会话/新客户端的上下文简报（默认 N=15）
   relay paste                   输出纯聊天客户端（豆包等）用的粘贴模板
   relay verify <receipt.json>   验证一份写回回执：存活检查 + 把产物应用到项目临时副本 + 跑测试
-                                [--project <dir>] [--test <cmd>] [--no-record]
+                                [--project <dir>] [--test <cmd>] [--no-record] [--json]
                                 退出码 0=PASS，1=FAIL，并在 handoff.md 留一条带署名的验证记录
                                 manual 模式允许改敏感路径但写审计日志
+                                --json 额外产出可复验的准入裁决（见文末「准入裁决」）
   relay auto --dispatch <cmd>   无人值守闭环：取一条待办 → 派发给 <cmd>（headless 模型）→ 收回执
                                 → relay verify → 通过才应用到工作树并移入已完成，否则退回待办
                                 [--task <关键词>] [--model <m>] [--test <cmd>] [--timeout <秒>] [--dry-run]
                                 [--allow-sensitive]  本轮放行敏感路径（auto 默认严格，敏感路径：.github/** .relay/** tests/** package.json）
+                                [--json]             产出可复验的准入裁决 JSON（见文末「准入裁决」）
   relay connect --client <name> 输出该客户端接入共享记忆 MCP 的配置
                                 name: qoder | workbuddy | openclaw | dsh | doubao
   relay help                    本帮助
@@ -79,6 +82,14 @@ const HELP = `relay — 接力棒：给 AI Agent 会话一份持久工作记录
   代码文件（.mjs/.js/.cjs）   维持 50% 字节阈值
   工作树守卫                 auto 派发前对项目树快照、派发后无条件还原：agent 的直写、新增文件/符号链接、
                               新建的空目录一律还原，只有过门 changes 才落地（排除 .git/node_modules/.relay）
+
+准入裁决（--json）:
+  relay verify <receipt.json> --json    不打印人话，输出结构化裁决 JSON，并追加一行到 .relay/evidence.jsonl
+  relay auto --dispatch <cmd> --json    同上（auto 跑完打印裁决）
+  裁决内容                              gate{name,version,policy} + verdict + receipt.sha256 + changes[].sha256
+                                       + checks[]（liveness / sensitive-path / destructive-write / path-containment / test-gate）
+                                       + evidence{testCmd,exitCode,outputSha256,durationMs} + chain{prev,self} 哈希链
+  能力分级                              L0 paste（纯聊天客户端，豁免存活检查）/ L1 tool / L2 exec
 
 环境变量:
   RELAY_WHO    默认署名（如 "Qoder/claude"），等价于 --who
@@ -414,29 +425,128 @@ function applyChanges(destDir, changes) {
   return { ok: true };
 }
 
-// opts: { strict: bool, onSensitive: (paths[]) => void }
+// ---- 准入裁决（admission verdict）：结构化、可复验、带版本 ----
+// 这是 agent-relay 的差异化定位：门不只回答「过/不过」，而是产出一份第三方可复验的裁决记录
+// （gate 版本 + 回执/变更哈希 + 逐项 checks + 测试证据 + 哈希链），并追加进 .relay/evidence.jsonl。
+const GATE_NAME = 'agent-relay/executeVerify';
+const GATE_VERSION = '1'; // 门策略版本：裁决口径变了就 +1，审计时能回答「哪一版门放行的」
+const VERDICT_SCHEMA_VERSION = 1;
+const EVIDENCE_FILE = 'evidence.jsonl';
+
+// 能力分级：让「没有文件能力的纯聊天客户端」也能合法参与，而不是被一刀切拒绝——这是本门的特点之一。
+const CAPABILITY_TIERS = {
+  L0: 'paste：无文件/无工具能力（纯聊天客户端），豁免 tool_call_count 存活检查',
+  L1: 'tool：有工具但未声明 exec，需 tool_call_count 为正整数',
+  L2: 'exec：声明可执行命令，仍需 tool_call_count 为正整数',
+};
+
+function sha256(text) {
+  return crypto.createHash('sha256').update(String(text), 'utf8').digest('hex');
+}
+
+// 稳定序列化（对象键排序）——保证同一份回执在任意语言实现下算出同一个哈希
+function stableJson(value) {
+  if (Array.isArray(value)) return '[' + value.map(stableJson).join(',') + ']';
+  if (value && typeof value === 'object') {
+    return '{' + Object.keys(value).sort().map((k) => JSON.stringify(k) + ':' + stableJson(value[k])).join(',') + '}';
+  }
+  return JSON.stringify(value === undefined ? null : value);
+}
+
+function capabilityTier(receipt) {
+  if (receipt && receipt.transport === 'paste') return 'L0';
+  const caps = Array.isArray(receipt && receipt.capabilities) ? receipt.capabilities.map(String) : [];
+  return caps.includes('exec') ? 'L2' : 'L1';
+}
+
+// 用哈希链封口：prev 指向上一条裁决的 self，形成可复验的证据链
+function sealVerdict(verdict, prev) {
+  verdict.chain = { prev: prev || 'genesis' };
+  verdict.chain.self = sha256(stableJson({ ...verdict, chain: { prev: verdict.chain.prev } }));
+  return verdict;
+}
+
+// 组装裁决对象（不含落盘）；checks 为 executeVerify 收集的逐项裁决
+function buildVerdict({ receipt, checks, res, testCmd, policy, evidence }) {
+  const rec = receipt && typeof receipt === 'object' ? receipt : {};
+  const changes = Array.isArray(rec.changes) ? rec.changes : [];
+  return sealVerdict({
+    schemaVersion: VERDICT_SCHEMA_VERSION,
+    gate: { name: GATE_NAME, version: GATE_VERSION, policy },
+    verdict: res.ok ? 'PASS' : 'FAIL',
+    reason: res.reason || '',
+    receipt: {
+      sha256: sha256(stableJson(rec)),
+      taskId: rec.task_id || null,
+      producer: {
+        client: rec.client || null,
+        model: rec.model || null,
+        transport: rec.transport || null,
+        tier: capabilityTier(rec),
+        toolCallCount: typeof rec.tool_call_count === 'number' ? rec.tool_call_count : null,
+      },
+    },
+    changes: changes.filter((c) => c && typeof c.path === 'string').map((c) => ({
+      path: normalizePath(c.path),
+      sha256: sha256(typeof c.content === 'string' ? c.content : ''),
+      bytes: Buffer.byteLength(typeof c.content === 'string' ? c.content : ''),
+    })),
+    checks: Array.isArray(checks) ? checks : [],
+    evidence: evidence || null,
+    timestamp: new Date().toISOString(),
+  }, 'genesis');
+}
+
+// 追加进 .relay/evidence.jsonl，并把 prev 接到上一条的 self 上（坏行/首次则从 genesis 起链）
+function appendEvidence(relayDir, verdict) {
+  const file = path.join(relayDir, EVIDENCE_FILE);
+  let prev = 'genesis';
+  try {
+    const lines = fs.readFileSync(file, 'utf8').split('\n').filter((l) => l.trim());
+    if (lines.length) {
+      const last = JSON.parse(lines[lines.length - 1]);
+      if (last && last.chain && last.chain.self) prev = last.chain.self;
+    }
+  } catch { /* 首次写入或坏文件：从 genesis 起链 */ }
+  sealVerdict(verdict, prev);
+  fs.appendFileSync(file, JSON.stringify(verdict) + '\n');
+  return verdict;
+}
+
+// opts: { strict: bool, onSensitive: (paths[]) => void, checks: [] | null }
 function executeVerify(receipt, project, testCmd, opts) {
-  const { strict = false, onSensitive = null } = opts || {};
+  const { strict = false, onSensitive = null, checks = null } = opts || {};
+  const mark = (id, ok, reason, severity = 'high') => { if (checks) checks.push({ id, ok, reason, severity }); };
   const isPaste = receipt.transport === 'paste';
   if (!isPaste) {
     const tcc = receipt.tool_call_count;
     if (!Number.isInteger(tcc) || tcc <= 0) {
+      mark('liveness', false, `tool_call_count=${JSON.stringify(tcc)}`, 'high');
       return { ok: false, reason: `存活检查未通过：tool_call_count=${JSON.stringify(tcc)}（疑似空跑/静默失败，比如只回「OK」）`, detail: '' };
     }
+    mark('liveness', true, `tool_call_count=${tcc}`, 'info');
+  } else {
+    mark('liveness', true, 'transport=paste：无文件客户端按 L0 受理，豁免 tool_call_count', 'info');
   }
   const changes = Array.isArray(receipt.changes) ? receipt.changes : null;
   if (!changes || !changes.length) {
+    mark('changes-present', false, '回执里没有非空 changes 数组', 'high');
     return { ok: false, reason: '回执里没有 changes 数组，无产物可验证', detail: '' };
   }
+  mark('changes-present', true, `${changes.length} 条变更`, 'info');
 
   // 裁决一：敏感路径守卫（严格模式在复制 temp 之前拦截）
   const sensitiveHits = changes.filter((c) => c && typeof c.path === 'string' && isSensitivePath(c.path));
   if (strict && sensitiveHits.length > 0) {
     const paths = sensitiveHits.map((c) => c.path).join(', ');
+    mark('sensitive-path', false, `严格模式命中敏感路径：${paths}`, 'high');
     return { ok: false, reason: `敏感路径守卫：auto 模式禁止修改 ${paths}，如确需改请人工执行`, detail: '' };
   }
   if (!strict && onSensitive && sensitiveHits.length > 0) {
     onSensitive(sensitiveHits.map((c) => c.path));
+    mark('sensitive-path', true, `manual 模式放行敏感路径（已写审计日志）：${sensitiveHits.map((c) => c.path).join(', ')}`, 'medium');
+  } else {
+    mark('sensitive-path', true, '未命中敏感路径', 'info');
   }
 
   // 裁决二：非代码文件按行防破坏守卫
@@ -453,6 +563,7 @@ function executeVerify(receipt, project, testCmd, opts) {
       const after = Buffer.byteLength(c.content);
       if (before > 0 && after < before * 0.5) {
         const pct = Math.round((after / before) * 100);
+        mark('destructive-write', false, `${c.path} 新内容仅原文件 ${pct}%（<50% 字节阈值）`, 'high');
         return { ok: false, reason: `疑似破坏性写入：${c.path} 新内容仅原文件的 ${pct}%（<50%），已拒绝；如确需大幅删改请人工执行`, detail: '' };
       }
     } else {
@@ -460,10 +571,12 @@ function executeVerify(receipt, project, testCmd, opts) {
       const origContent = fs.readFileSync(orig, 'utf8');
       const destructiveReason = checkNonCodeDestructive(origContent, c.content);
       if (destructiveReason) {
+        mark('destructive-write', false, destructiveReason, 'high');
         return { ok: false, reason: `疑似破坏性写入：${destructiveReason}`, detail: '' };
       }
     }
   }
+  mark('destructive-write', true, '未触发破坏性写入守卫（代码文件 ≥50% 字节 / 非代码文件未删原有非空行）', 'info');
 
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-verify-'));
   try {
@@ -472,16 +585,24 @@ function executeVerify(receipt, project, testCmd, opts) {
       filter: (src) => { const b = path.basename(src); return b !== '.git' && b !== 'node_modules'; },
     });
     const applied = applyChanges(temp, changes);
-    if (!applied.ok) return { ok: false, reason: applied.reason, detail: '' };
+    if (!applied.ok) {
+      mark('path-containment', false, applied.reason, 'high');
+      return { ok: false, reason: applied.reason, detail: '' };
+    }
+    mark('path-containment', true, '全部变更路径都在项目目录内', 'info');
     const r = spawnSync(testCmd, { shell: true, cwd: temp, encoding: 'utf8' });
     const detail = ((r.stdout || '') + (r.stderr || '')).trim();
     const ok = r.status === 0;
+    mark('test-gate', ok, `\`${testCmd}\` 退出码 ${r.status}`, 'high');
     return {
       ok,
       reason: ok ? `验证通过：产物已应用到临时副本，测试命令 \`${testCmd}\` 退出码 0` : `验证失败：测试命令 \`${testCmd}\` 退出码 ${r.status}`,
       detail,
+      exitCode: typeof r.status === 'number' ? r.status : null,
+      outputSha256: sha256(detail),
     };
   } catch (e) {
+    mark('verify-error', false, e.message, 'high');
     return { ok: false, reason: '验证过程异常：' + e.message, detail: '' };
   } finally {
     fs.rmSync(temp, { recursive: true, force: true });
@@ -507,31 +628,61 @@ function cmdVerify(args) {
   const root = rootOrFail();
   const relay = path.join(root, RELAY_DIR);
   const receiptPath = args.shift();
-  if (!receiptPath) fail('verify 需要回执文件：relay verify <receipt.json> [--project <dir>] [--test <cmd>] [--no-record]');
+  if (!receiptPath) fail('verify 需要回执文件：relay verify <receipt.json> [--project <dir>] [--test <cmd>] [--no-record] [--json]');
   const projectArg = flag(args, '--project');
   const testArg = flag(args, '--test');
   const noRecord = args.includes('--no-record');
+  const jsonOut = args.includes('--json');
   const project = path.resolve(projectArg || root);
+  const meta = JSON.parse(read(path.join(relay, 'relay.json')) || '{}');
+  const testCmd = testArg || (meta.verify && meta.verify.test) || 'npm test';
+  const startedAt = Date.now();
+  const checks = [];
 
-  let receipt;
+  let receipt = null;
+  let parseError = '';
   try {
     receipt = JSON.parse(fs.readFileSync(path.resolve(receiptPath), 'utf8'));
   } catch (e) {
-    return conclude(relay, {}, { ok: false, reason: '回执读取/解析失败：' + e.message, detail: '' }, noRecord);
+    parseError = '回执读取/解析失败：' + e.message;
   }
-  const meta = JSON.parse(read(path.join(relay, 'relay.json')) || '{}');
-  const testCmd = testArg || (meta.verify && meta.verify.test) || 'npm test';
 
-  // manual 模式：strict=false，记审计日志
-  const auditLines = [];
-  const onSensitive = (paths) => {
-    auditLines.push(`- [${stamp()}] [verify:manual] 放行敏感路径：${paths.join(', ')}`);
-  };
-  const res = executeVerify(receipt, project, testCmd, { strict: false, onSensitive });
-  if (auditLines.length > 0) {
-    fs.appendFileSync(path.join(relay, 'handoff.md'), auditLines.join('\n') + '\n');
+  let res;
+  if (parseError) {
+    checks.push({ id: 'receipt-parse', ok: false, reason: parseError, severity: 'high' });
+    res = { ok: false, reason: parseError, detail: '' };
+  } else {
+    // manual 模式：strict=false，记审计日志
+    const auditLines = [];
+    const onSensitive = (paths) => {
+      auditLines.push(`- [${stamp()}] [verify:manual] 放行敏感路径：${paths.join(', ')}`);
+    };
+    res = executeVerify(receipt, project, testCmd, { strict: false, onSensitive, checks });
+    if (auditLines.length > 0) {
+      fs.appendFileSync(path.join(relay, 'handoff.md'), auditLines.join('\n') + '\n');
+    }
   }
-  conclude(relay, receipt, res, noRecord);
+
+  if (jsonOut) {
+    const verdict = buildVerdict({
+      receipt: receipt || {},
+      checks,
+      res,
+      testCmd,
+      policy: 'manual',
+      evidence: {
+        testCmd,
+        exitCode: typeof res.exitCode === 'number' ? res.exitCode : null,
+        outputSha256: res.outputSha256 || null,
+        durationMs: Date.now() - startedAt,
+        tempApplied: typeof res.exitCode === 'number',
+      },
+    });
+    if (!noRecord) appendEvidence(relay, verdict);
+    console.log(JSON.stringify(verdict, null, 2));
+    process.exit(res.ok ? 0 : 1);
+  }
+  conclude(relay, receipt || {}, res, noRecord);
 }
 
 function findTodoIdx(lines) {
@@ -598,6 +749,7 @@ function cmdAuto(args) {
   const timeout = parseInt(flag(args, '--timeout') || '600', 10);
   const dryRun = args.includes('--dry-run');
   const allowSensitive = args.includes('--allow-sensitive');
+  const jsonOut = args.includes('--json');
   if (!dispatch) fail('auto 需要 --dispatch <cmd>：一个接收任务、产出回执 JSON 的命令（示例见 examples/dispatch-openclaw.mjs）');
 
   const bp = path.join(root, RELAY_DIR, 'board.md');
@@ -623,6 +775,8 @@ function cmdAuto(args) {
   const testCmd = testArg || (meta.verify && meta.verify.test) || 'npm test';
   const handoff = path.join(relay, 'handoff.md');
   const record = (line) => fs.appendFileSync(handoff, `- [${stamp()}] ${line}\n`);
+  const checks = [];
+  const startedAt = Date.now();
 
   if (!dryRun) {
     content = relocateTodo(content, ti, '进行中', false);
@@ -631,6 +785,7 @@ function cmdAuto(args) {
 
   const work = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-auto-'));
   let res;
+  let receipt = null;
   try {
     const promptFile = path.join(work, 'task.md');
     const receiptOut = path.join(work, 'receipt.json');
@@ -660,10 +815,10 @@ function cmdAuto(args) {
     }
     let receiptRaw = fs.existsSync(receiptOut) ? fs.readFileSync(receiptOut, 'utf8').trim() : '';
     if (!receiptRaw) receiptRaw = (d.stdout || '').trim();
-    let receipt = null;
     try { receipt = JSON.parse(receiptRaw); } catch { receipt = null; }
     if (!receipt) {
       const why = d.error ? `派发命令执行失败：${d.error.message}` : `派发未产出合法回执 JSON（退出码 ${d.status}）`;
+      checks.push({ id: 'receipt-present', ok: false, reason: why, severity: 'high' });
       res = { ok: false, reason: why, detail: ((d.stdout || '') + (d.stderr || '')).trim() };
     } else {
       console.log(`relay auto: 收到回执 model=${receipt.model || '?'} client=${receipt.client || '?'} tool_call_count=${JSON.stringify(receipt.tool_call_count)}`);
@@ -673,7 +828,7 @@ function cmdAuto(args) {
       const onSensitive = (paths) => {
         auditLines.push(`- [${stamp()}] [auto:allow-sensitive] 放行敏感路径：${paths.join(', ')}`);
       };
-      res = executeVerify(receipt, root, testCmd, { strict, onSensitive });
+      res = executeVerify(receipt, root, testCmd, { strict, onSensitive, checks });
       if (auditLines.length > 0) record(auditLines.join('\n'));
       if (res.ok && !dryRun) {
         const applied = applyChanges(root, receipt.changes);
@@ -701,6 +856,24 @@ function cmdAuto(args) {
       record(`[auto:REJECTED] task=${taskId}「${taskText}」model=${model || '?'} reason=${res.reason} → 未应用，退回待办`);
     }
     fs.writeFileSync(bp, board);
+  }
+  if (jsonOut) {
+    const verdict = buildVerdict({
+      receipt: receipt || {},
+      checks,
+      res,
+      testCmd,
+      policy: allowSensitive ? 'auto-allow-sensitive' : 'auto-strict',
+      evidence: {
+        testCmd,
+        exitCode: typeof res.exitCode === 'number' ? res.exitCode : null,
+        outputSha256: res.outputSha256 || null,
+        durationMs: Date.now() - startedAt,
+        tempApplied: typeof res.exitCode === 'number',
+      },
+    });
+    appendEvidence(relay, verdict);
+    console.log(JSON.stringify(verdict, null, 2));
   }
   process.exit(res.ok ? 0 : 1);
 }
@@ -768,4 +941,4 @@ switch (cmd) {
   default: fail(`未知命令 ${cmd}，运行 relay help`);
 }
 
-export { executeVerify, applyChanges, isSensitivePath, checkNonCodeDestructive, SENSITIVE_PATTERNS, isCodeFile, snapshotTree, restoreTree };
+export { executeVerify, applyChanges, isSensitivePath, checkNonCodeDestructive, SENSITIVE_PATTERNS, isCodeFile, snapshotTree, restoreTree, buildVerdict, appendEvidence, capabilityTier, stableJson, sha256, GATE_NAME, GATE_VERSION, VERDICT_SCHEMA_VERSION, EVIDENCE_FILE, CAPABILITY_TIERS };

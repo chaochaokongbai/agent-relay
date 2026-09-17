@@ -149,6 +149,33 @@ relay auto --dispatch "node examples/dispatch-echo.mjs" --test "node -e \"proces
 | 分歧没人裁决，模型自作主张 | decisions.md「待裁决」区，用户拍板 |
 | 模型嘴上「干完了」其实空跑 | `relay verify` 信代码不信嘴：产物应用后跑测试，绿了才算 PASS |
 
+## 进阶：准入裁决（给 AI agent 的 branch protection）
+
+别的工具管「谁干什么」，接力棒管**「这份产物允不允许进工作树」**——编排器可以换，裁判不必换。
+
+```bash
+relay verify receipt.json --test "npm test" --json    # 输出可复验的准入裁决，并入 .relay/evidence.jsonl
+relay auto --dispatch <cmd> --json                    # 无人值守闭环，同样产出裁决
+```
+
+裁决不是一句「过了」，而是一份第三方能自己复算的证据：
+
+```
+gate{name,version,policy} + verdict + receipt.sha256 + changes[].sha256
+  + checks[]  liveness / sensitive-path / destructive-write / path-containment / test-gate
+  + evidence{testCmd, exitCode, outputSha256, durationMs}
+  + chain{prev, self}   哈希链：改任何一条历史记录都会断链
+```
+
+两个特点（见 [`spec/ADMISSION.md`](spec/ADMISSION.md)）：
+
+- **能力分级**：`L0` 纯聊天客户端（粘贴通道，豁免工具调用计数）/ `L1` 有文件工具 / `L2` 可执行命令。
+  没有文件能力的客户端也能合法参与协作，而不是被一刀切拒绝。
+- **可复验**：回执、每条变更、测试输出全部有哈希；`evidence.jsonl` 首尾相连。不信任接力棒的人，
+  也能自己验链、验哈希、重跑证据（spec 第 4 节给了复验步骤）。
+
+> 门防的是「老实但会出错的模型」，不防恶意；已知边界诚实列在 spec 第 8 节。
+
 ## 调研来源（痛点出处）
 
 - [为什么你的 AI 编程助手会突然变傻？7 个坑一次讲透](https://m.toutiao.com/article/7670716914649350708/)

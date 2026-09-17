@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { executeVerify, isSensitivePath, checkNonCodeDestructive, isCodeFile, snapshotTree, restoreTree } from '../bin/relay.mjs';
+import { executeVerify, isSensitivePath, checkNonCodeDestructive, isCodeFile, snapshotTree, restoreTree, capabilityTier, stableJson, sha256, GATE_VERSION } from '../bin/relay.mjs';
 
 const BIN = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'bin', 'relay.mjs');
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-test-'));
@@ -528,6 +528,90 @@ check('auto 工作树守卫: 门 FAIL 时直写同样被还原', () => {
   assert(!fs.existsSync(path.join(tmpG, 'GATED-FAIL.txt')), '未过门产物绝不能落地');
 });
 
+// 准入裁决（--json）与证据链：spec/ADMISSION.md 的契约
+const tmpJ = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-test-verdict-'));
+const runJ = (...args) => execFileSync(process.execPath, [BIN, ...args], { cwd: tmpJ, encoding: 'utf8', env: { ...process.env, RELAY_WHO: 'tester' } });
+const runSafeJ = (...args) => { try { return { ok: true, status: 0, out: runJ(...args) }; } catch (e) { return { ok: false, status: e.status, out: (e.stdout || '') + (e.stderr || '') }; } };
+const writeReceiptJ = (name, obj) => { fs.writeFileSync(path.join(tmpJ, name), JSON.stringify(obj)); return name; };
+const evidenceLines = () => fs.readFileSync(path.join(tmpJ, '.relay', 'evidence.jsonl'), 'utf8').split('\n').filter((l) => l.trim());
+const verdictTest = `node -e "process.exit(require('fs').existsSync('probe.txt')?0:1)"`;
+
+check('--json: PASS 裁决形状完整、哈希可复算', () => {
+  runJ('init');
+  const rec = { task_id: 'j1', client: 'DSH', model: 'deepseek-v4-flash', transport: 'mcp', capabilities: ['files'], tool_call_count: 5, changes: [{ path: 'probe.txt', content: 'hi' }] };
+  const r = runSafeJ('verify', writeReceiptJ('j1.json', rec), '--project', tmpJ, '--test', verdictTest, '--json');
+  assert(r.status === 0, '应 PASS，实际 ' + r.status + '：' + r.out);
+  const v = JSON.parse(r.out);
+  assert(v.schemaVersion === 1, 'schemaVersion 应为 1');
+  assert(v.verdict === 'PASS' && v.gate.name === 'agent-relay/executeVerify' && v.gate.version === GATE_VERSION, 'gate 元信息不对：' + JSON.stringify(v.gate));
+  assert(v.gate.policy === 'manual', 'verify 的 policy 应为 manual');
+  assert(v.receipt.sha256 === sha256(stableJson(rec)), 'receipt 哈希应可复算');
+  assert(v.receipt.producer.tier === 'L1' && v.receipt.producer.model === 'deepseek-v4-flash', 'producer 应带 tier 与模型名');
+  assert(v.changes.length === 1 && v.changes[0].path === 'probe.txt' && v.changes[0].sha256 === sha256('hi') && v.changes[0].bytes === 2, 'changes 哈希/字节数不对');
+  const ids = v.checks.map((c) => c.id);
+  for (const id of ['liveness', 'changes-present', 'sensitive-path', 'destructive-write', 'path-containment', 'test-gate']) {
+    assert(ids.includes(id), '缺 check：' + id);
+  }
+  assert(v.checks.every((c) => c.ok === true), 'PASS 裁决里不应有失败项：' + JSON.stringify(v.checks));
+  assert(v.evidence.exitCode === 0 && v.evidence.tempApplied === true && /probe\.txt/.test(v.evidence.testCmd), '测试证据不对：' + JSON.stringify(v.evidence));
+  assert(v.chain.prev === 'genesis' && /^[0-9a-f]{64}$/.test(v.chain.self), '首条应接 genesis 且 self 为 sha256');
+  assert(sha256(stableJson({ ...v, chain: { prev: v.chain.prev } })) === v.chain.self, 'chain.self 应可复算');
+});
+
+check('--json: 证据链逐条相连，改历史即断链', () => {
+  const rec2 = { task_id: 'j2', client: 'DSH', model: 'deepseek-v4-flash', transport: 'mcp', tool_call_count: 2, changes: [{ path: 'probe.txt', content: 'hi2' }] };
+  const r = runSafeJ('verify', writeReceiptJ('j2.json', rec2), '--project', tmpJ, '--test', verdictTest, '--json');
+  assert(r.status === 0, '第二条应 PASS：' + r.out);
+  const v2 = JSON.parse(r.out);
+  const lines = evidenceLines();
+  assert(lines.length === 2, 'evidence.jsonl 应有 2 条，实际 ' + lines.length);
+  const v1 = JSON.parse(lines[0]);
+  assert(v2.chain.prev === v1.chain.self, 'prev 应指向上一条 self');
+  const tampered = sha256(stableJson({ ...v1, verdict: 'FAIL', chain: { prev: v1.chain.prev } }));
+  assert(tampered !== v1.chain.self, '篡改历史记录后哈希必须不匹配（断链）');
+});
+
+check('--json: FAIL 裁决带失败 check 且不留测试证据', () => {
+  const rec = { task_id: 'j3', client: 'Bad', model: 'noop', transport: 'mcp', tool_call_count: 0, changes: [{ path: 'probe2.txt', content: 'x' }] };
+  const r = runSafeJ('verify', writeReceiptJ('j3.json', rec), '--project', tmpJ, '--test', verdictTest, '--json');
+  assert(r.status === 1, '空跑应 FAIL');
+  const v = JSON.parse(r.out);
+  assert(v.verdict === 'FAIL', '应为 FAIL');
+  const live = v.checks.find((c) => c.id === 'liveness');
+  assert(live && live.ok === false && live.severity === 'high', '应有 liveness 失败项：' + JSON.stringify(v.checks));
+  assert(v.evidence.exitCode === null && v.evidence.tempApplied === false, '没跑到测试就不该有退出码');
+});
+
+check('能力分级: paste=L0 / 默认 L1 / 声明 exec=L2', () => {
+  assert(capabilityTier({ transport: 'paste', tool_call_count: 0 }) === 'L0', 'paste 应为 L0');
+  assert(capabilityTier({ transport: 'mcp', tool_call_count: 1 }) === 'L1', '默认应为 L1');
+  assert(capabilityTier({ transport: 'mcp', capabilities: ['files', 'exec'] }) === 'L2', '声明 exec 应为 L2');
+});
+
+check('规范与实现一致: spec 存在，且实现产出的 check id 都在 schema 枚举内', () => {
+  const specDir = path.join(path.dirname(BIN), '..', 'spec');
+  const receiptSchema = JSON.parse(fs.readFileSync(path.join(specDir, 'receipt.schema.json'), 'utf8'));
+  const verdictSchema = JSON.parse(fs.readFileSync(path.join(specDir, 'verdict.schema.json'), 'utf8'));
+  assert(receiptSchema.$schema.includes('2020-12') && receiptSchema.required.includes('changes'), 'receipt schema 形状不对');
+  assert(verdictSchema.$schema.includes('2020-12') && verdictSchema.required.includes('verdict'), 'verdict schema 形状不对');
+  const allowed = verdictSchema.properties.checks.items.properties.id.enum;
+  const seen = new Set(evidenceLines().map((l) => JSON.parse(l)).flatMap((v) => v.checks.map((c) => c.id)));
+  assert(seen.size > 0, '应已产过裁决');
+  for (const id of seen) assert(allowed.includes(id), '实现产出的 check id 不在规范里：' + id);
+});
+
+check('auto --json: 跑完打印裁决并追加证据', () => {
+  runJ('board', 'add', 'auto 裁决输出');
+  const r = runSafeJ('auto', '--task', 'auto 裁决输出', '--dispatch', `node "${ECHO}"`, '--test', noteTest, '--model', 'none', '--json');
+  assert(r.status === 0, 'auto 应 PASS：' + r.out);
+  const m = r.out.match(/\n(\{[\s\S]*\})\s*$/);
+  assert(m, 'stdout 末尾应有裁决 JSON：' + r.out.slice(-300));
+  const v = JSON.parse(m[1]);
+  assert(v.verdict === 'PASS' && v.gate.policy === 'auto-strict', 'auto 裁决策略应为 auto-strict：' + JSON.stringify(v.gate));
+  assert(v.checks.some((c) => c.id === 'test-gate' && c.ok === true), '应含 test-gate 通过项');
+  assert(v.receipt.producer.tier === 'L1', 'echo 回执应判为 L1');
+});
+
 // cleanup
 fs.rmSync(tmp, { recursive: true, force: true });
 fs.rmSync(tmp2, { recursive: true, force: true });
@@ -537,5 +621,6 @@ fs.rmSync(tmp4as, { recursive: true, force: true });
 fs.rmSync(tmpG, { recursive: true, force: true });
 fs.rmSync(tmpPrune, { recursive: true, force: true });
 fs.rmSync(tmpLink, { recursive: true, force: true });
+fs.rmSync(tmpJ, { recursive: true, force: true });
 if (failed) process.exit(1);
 console.log('all tests passed');

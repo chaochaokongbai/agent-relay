@@ -1,0 +1,108 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/chaochaokongbai/agent-relay/spec/verdict.schema.json",
+  "title": "agent-relay 准入裁决 verdict",
+  "description": "门对一份回执的裁决记录。它不只是「过/不过」，而是可被第三方独立复验的证据：门版本 + 回执/变更哈希 + 逐项 checks + 测试证据 + 哈希链。`relay verify --json` 与 `relay auto --json` 输出它，并逐行追加到 .relay/evidence.jsonl。",
+  "type": "object",
+  "required": ["schemaVersion", "gate", "verdict", "receipt", "changes", "checks", "chain", "timestamp"],
+  "properties": {
+    "schemaVersion": { "type": "integer", "const": 1 },
+    "gate": {
+      "type": "object",
+      "required": ["name", "version", "policy"],
+      "properties": {
+        "name": { "type": "string", "description": "固定为 agent-relay/executeVerify" },
+        "version": { "type": "string", "description": "门策略版本。裁决口径变了就 +1：审计能回答「这个产物是哪一版门放行的」" },
+        "policy": { "enum": ["manual", "auto-strict", "auto-allow-sensitive"], "description": "本轮使用的策略档位" }
+      },
+      "additionalProperties": true
+    },
+    "verdict": { "enum": ["PASS", "FAIL"] },
+    "reason": { "type": "string", "description": "人类可读的一句话结论" },
+    "receipt": {
+      "type": "object",
+      "required": ["sha256", "producer"],
+      "properties": {
+        "sha256": { "type": "string", "description": "整份回执的稳定序列化哈希（键排序 + UTF-8），任何语言都能复算" },
+        "taskId": { "type": ["string", "null"] },
+        "producer": {
+          "type": "object",
+          "properties": {
+            "client": { "type": ["string", "null"] },
+            "model": { "type": ["string", "null"] },
+            "transport": { "type": ["string", "null"] },
+            "tier": { "enum": ["L0", "L1", "L2"], "description": "能力分级，见 spec/ADMISSION.md" },
+            "toolCallCount": { "type": ["integer", "null"] }
+          },
+          "additionalProperties": true
+        }
+      },
+      "additionalProperties": true
+    },
+    "changes": {
+      "type": "array",
+      "description": "产物清单（只记哈希与字节数，不重复存正文）",
+      "items": {
+        "type": "object",
+        "required": ["path", "sha256", "bytes"],
+        "properties": {
+          "path": { "type": "string", "description": "归一化为正斜杠的相对路径" },
+          "sha256": { "type": "string" },
+          "bytes": { "type": "integer" }
+        },
+        "additionalProperties": true
+      }
+    },
+    "checks": {
+      "type": "array",
+      "description": "逐项裁决。id 见 spec/ADMISSION.md 的 checks 枚举；未执行到的项不会出现在数组里（判定短路）。",
+      "items": {
+        "type": "object",
+        "required": ["id", "ok", "reason", "severity"],
+        "properties": {
+          "id": {
+            "enum": [
+              "receipt-parse",
+              "receipt-present",
+              "liveness",
+              "changes-present",
+              "sensitive-path",
+              "destructive-write",
+              "path-containment",
+              "test-gate",
+              "verify-error"
+            ]
+          },
+          "ok": { "type": "boolean" },
+          "reason": { "type": "string" },
+          "severity": { "enum": ["high", "medium", "info"], "description": "ok=false 时该失败的严重度；info 表示仅留痕" }
+        },
+        "additionalProperties": true
+      }
+    },
+    "evidence": {
+      "type": ["object", "null"],
+      "description": "测试证据。tempApplied=true 表示产物真的被应用进临时副本并跑过测试命令。",
+      "properties": {
+        "testCmd": { "type": "string" },
+        "exitCode": { "type": ["integer", "null"] },
+        "outputSha256": { "type": ["string", "null"], "description": "测试输出（stdout+stderr）的哈希，便于比对「同样的失败」" },
+        "durationMs": { "type": "integer" },
+        "tempApplied": { "type": "boolean" }
+      },
+      "additionalProperties": true
+    },
+    "chain": {
+      "type": "object",
+      "required": ["prev", "self"],
+      "description": "哈希链：prev 指向上一条 evidence.jsonl 记录的 self（首条为 genesis），self = 本裁决（chain 只含 prev 时）的稳定序列化哈希。改动任何一条历史记录都会断链。",
+      "properties": {
+        "prev": { "type": "string" },
+        "self": { "type": "string" }
+      },
+      "additionalProperties": true
+    },
+    "timestamp": { "type": "string", "description": "ISO 8601（UTC）" }
+  },
+  "additionalProperties": true
+}
